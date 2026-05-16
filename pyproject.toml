@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piano-guard"
+version = "0.1.0"
+description = "CLI-first auto-grouping, ingest, and Resolve automation for multi-camera piano projects"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "hdbscan>=0.8.33,<1",
+  "numpy>=1.26,<3",
+  "opencv-python-headless>=4.10,<5",
+  "PyYAML>=6.0,<7",
+  "sam2>=1.1,<2",
+  "scipy>=1.14,<2",
+  "torch>=2.4,<3",
+]
+
+[project.scripts]
+piano-guard = "piano_guard.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

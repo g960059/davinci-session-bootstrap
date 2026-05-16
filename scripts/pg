@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Wrapper: exec the vendored piano-guard CLI from this skill's .venv.
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ ! -x "$DIR/.venv/bin/piano-guard" ]]; then
+  echo "error: $DIR/.venv/bin/piano-guard not found. Run scripts/install.sh first." >&2
+  exit 1
+fi
+exec "$DIR/.venv/bin/piano-guard" "$@"
