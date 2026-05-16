@@ -1,24 +1,25 @@
 ---
 name: davinci-session-bootstrap
 description: |
-  Bootstrap a new piano session end-to-end: auto-group incoming MP4s + audio bounce into
-  takes, then create a DaVinci Resolve project with waveform-synced clips. Stops at the
-  bootstrap boundary; hand-off to /color-review or `pg auto-color-normalize` for color
-  stages. Wraps the bundled piano-guard CLI.
+  End-to-end piano session bootstrap: auto-group incoming MP4s + audio bounce into takes,
+  create a DaVinci Resolve project with waveform-synced clips, then run AI-driven
+  cross-angle color review (closed-loop CDL preview + Resolve commit). Operator can opt
+  out of the color stage per session. Wraps the bundled piano-guard CLI.
 disable-model-invocation: true
 ---
 
 # davinci-session-bootstrap
 
-Drives the piano-guard CLI through the bootstrap stages — `group-session` and
-`prepare-resolve-session` — for a new piano session. Operator drops camera
+Drives the piano-guard CLI through three stages for a new piano session:
+**A. group-session** (incoming → takes), **B. prepare-resolve-session**
+(Resolve project + waveform sync), **C. AI cross-angle color review**
+(per-clip CDLs committed to `auto-state-99-v1`). Operator drops camera
 MP4s and a Logic Pro audio bounce into `<session-root>/incoming/`, invokes
-`/davinci-session-bootstrap <session-root>`, and ends with a DaVinci Resolve project
-that has takes assembled, audio-edit proxies generated, and clips
-waveform-synced and ready for color review.
+`/davinci-session-bootstrap <session-root>`, and ends with a Resolve
+project ready to edit.
 
-The skill stops at bootstrap. Color stages (`auto-color-normalize`, AI-driven
-`/color-review`) are explicit follow-ups, not part of this skill.
+Operator can opt out of Stage C per session ("skip color" / 「色は手動でやる」)
+— skill exits cleanly after Stage B in that case.
 
 ## When to use
 
@@ -89,6 +90,30 @@ ${CLAUDE_SKILL_DIR}/scripts/pg prepare-resolve-session "<session-root>" --json -
   - Calls `MediaPool.AutoSyncAudio` waveform-based — no timecode required.
   - Applies the project color management to YRGB Auto SDR Rec.709.
 
+### Stage C — Cross-angle color review (closed loop)
+
+After Stage B succeeds, **read
+`${CLAUDE_SKILL_DIR}/color-review.md`** for the full protocol (visual
+cheatsheet, conservative bounds, pitfalls, escapes). Skip the read and
+proceed directly to summary if the operator opted out (see below).
+
+Brief outline:
+1. `pg render-stills "<session-root>" --json` — generates per-(take,angle)
+   PNGs at `<session>/reports/stills/<take_id>/<angle>.png`.
+2. Reference angle comes from `session.yaml.reference_angle` (Stage A set
+   it). If absent, ask the operator before proceeding.
+3. For each non-reference clip: Read source still + reference still →
+   propose slope+offset → `pg preview-cdl ... --out preview.png` → Read
+   preview → iterate 3-5 times until visually matching reference →
+   `pg manual-cdl ... --slope ... --offset ...` commits to
+   `auto-state-99-v1`.
+4. Summarize what was applied per take/angle and direct the operator to
+   load `auto-state-99-v1` in Resolve's Color page to verify.
+
+**Opt-out**: if the operator says "skip color" / 「色は手動でやる」 /
+「Stage C は飛ばして」 (or equivalent), exit after Stage B with the
+bootstrap-only hand-off. Do NOT run render-stills.
+
 ## What Claude resolves automatically
 
 - **Project library / project name**: defaults derived from
@@ -99,18 +124,31 @@ ${CLAUDE_SKILL_DIR}/scripts/pg prepare-resolve-session "<session-root>" --json -
 
 ## Hand-off
 
-On bootstrap success, summarize and direct the operator:
+After Stage C (or after Stage B if color was skipped), summarize and direct
+the operator. With color:
 
 ```
-Session bootstrap complete.
+Session bootstrap complete (Stages A, B, C).
+  Takes: <N>
+  Reference angle: <angle>
+  Resolve project: <project_name>
+  Color: committed auto-state-99-v1 on <K> clip(s).
+
+Next step: open Resolve, right-click each clip's thumbnail →
+Remote Versions → auto-state-99-v1 → Load to verify the grade. Tweak via
+Primary Balance if needed; LUTs are intentionally not used.
+```
+
+Color skipped:
+
+```
+Session bootstrap complete (Stages A, B; color skipped).
   Takes: <N>
   Reference angle: <angle>
   Resolve project: <project_name>
 
-Next steps (operator chooses):
-  - For automatic CDL across angles:  pg auto-color-normalize "<session-root>"
-  - For AI-driven per-clip CDL:       /color-review on <session-root>
-  - To skip color and go to editing:  open Resolve and proceed.
+Color review can be re-run later by invoking this skill again and NOT
+opting out of Stage C.
 ```
 
 On any FAIL, surface the failing report path and the relevant
@@ -131,6 +169,13 @@ input.
   group-session will refuse a plan that mixes them.
 - **Audio file naming**: prefer `audio.wav`. Other names work but are
   matched by a fallback heuristic; a clear name avoids ambiguity.
+- **Stage C requires the operator's project color management to stay on
+  YRGB Auto SDR Rec.709**. Stage B applies this, but if the operator
+  changed it between Stage B and Stage C, `preview-cdl`'s offline math
+  diverges from Resolve's actual application — flag and revert before
+  committing.
+- **Never propose LUTs in Stage C.** Primary Balance (CDL) only. Operator
+  needs editable starter grades; LUTs are opaque.
 
 ## Escape
 
@@ -142,6 +187,8 @@ input.
 | Stage A `status: FAIL` with `code: missing_audio` | Operator places `audio.wav` in `incoming/`; re-run stage A. |
 | Stage B `status: FAIL` with `code: project_settings_mismatch` | Surface mismatch list; ask operator to confirm before retrying with `--fresh`. |
 | Stage B WARN with `setcdl_unverified` | Acceptable — identity color path. Continue. |
+| Stage C `manual-cdl` returns `reason: multicam_exists` | Stage C must run before multicam clips are created; ask operator if they intended to redo bootstrap. |
+| Stage C iteration not converging (>5 preview cycles for one clip) | See `color-review.md` escape hatches — pick a different reference or mark clip as needs-manual-grading. |
 
 ## Updating the bundled CLI
 

@@ -1,7 +1,7 @@
 # davinci-session-bootstrap skill
 
-User-global Claude Code skill that wraps the piano-guard CLI to bootstrap a
-new piano session in DaVinci Resolve.
+User-global Claude Code skill that wraps the piano-guard CLI to bootstrap
+a new piano session in DaVinci Resolve, end to end.
 
 Invoke from any directory in Claude Code:
 
@@ -9,10 +9,16 @@ Invoke from any directory in Claude Code:
 /davinci-session-bootstrap <session-root>
 ```
 
-The skill reads `SKILL.md` and walks Claude through `group-session` →
-`prepare-resolve-session`. It does **not** include color stages — those
-remain in `/color-review` (project-level skill in the davinci-automation
-repo) or in the standalone `pg auto-color-normalize` command.
+The skill reads `SKILL.md` and walks Claude through three stages:
+
+1. **group-session** — `incoming/*.mp4 + audio.{wav,aif,...}` → `takes/take-XX/`.
+2. **prepare-resolve-session** — create / open Resolve project, generate
+   audio-edit proxies, waveform-sync each take.
+3. **AI cross-angle color review** — render stills, propose per-clip CDLs,
+   preview offline, commit to `auto-state-99-v1` in Resolve. Detail lives
+   in `color-review.md` (loaded on demand).
+
+Operator can opt out of stage 3 per session ("skip color" / 「色は手動でやる」).
 
 ## First-time setup
 
@@ -85,19 +91,30 @@ After bootstrap:
 │       ├── audio-edit.wav     # 48 kHz / 24-bit proxy for Resolve sync
 │       └── take.yaml
 ├── reports/
-│   └── prepare-resolve-session.json
+│   ├── prepare-resolve-session.json
+│   ├── stills/                # Stage C: per-clip PNGs (HLG→Rec.709 tonemapped)
+│   │   └── <take>/<angle>.png
+│   └── manual-cdl.json        # Stage C: CDLs committed to Resolve
 └── resolve/                   # .drp snapshot of the bootstrapped project
 ```
 
-## What the skill does NOT do
+## Scope
 
-- **Color grading**: handed off to `/color-review` or `pg auto-color-normalize`.
+In scope (Stage C):
+
+- **Color review** (per-clip Primary Balance / CDL). Operator can opt out
+  per session if they want to grade manually in Resolve.
+
+Out of scope:
+
 - **Editorial assembly**: multicam clips, Session_Assembly timeline,
   Piece_* timelines remain manual operations in Resolve.
 - **Logic Pro automation**: piano-guard reads the `.logicx` path as a
   sidecar reference but does not drive Logic Pro.
 - **Auto-installation**: the operator runs `install.sh` once; the skill
   never silently runs network/build inside a Claude turn.
+- **LUT-based grading**: by design only Primary Balance / CDL is written
+  to Resolve, since LUTs are opaque and not operator-editable.
 
 ## Source of the vendored CLI
 
