@@ -1,31 +1,28 @@
-"""Still-frame rendering for the ``/color-review`` Claude Code skill.
+"""Still-frame rendering for AI-assisted color review.
 
-Phase 2's auto-color-normalize produces a CDL that is sometimes visually
-wrong (piano-body reflections of windows, 2-anchor fits that clip when
-applied to the full image, etc.). Option C in the roadmap is to let a
-vision-capable AI agent look at per-clip still frames, reason holistically
-about color matching, and propose CDLs that the mask-based pipeline
-can't.
+The color-review pipeline lets a vision-capable AI agent look at per-clip
+still frames, reason holistically about cross-angle color matching, and
+propose conservative CDLs.
 
 This module is the scripting half of that loop: given a session, render
 one mid-frame PNG per (take, angle) clip, in a display-ready Rec.709
-form so Claude (or any human) can inspect the ungraded content without
+form so an AI agent or human can inspect the ungraded content without
 a DaVinci Resolve round-trip.
 
 Design decisions:
 
 * **Ungraded only.** The renderer operates on the source file directly;
-  it does not apply any CDL or LUT. This keeps the output representative
+  it does not apply any CDL. This keeps the output representative
   of the scene as captured, which is what the AI agent needs to reason
   about "what does this clip actually look like."
-* **HLG → Rec.709 SDR.** Source is Sony PP10 HLG. Writing a PNG of a
+* **HLG -> Rec.709 SDR.** Source is Sony α6400 PP10 HLG. Writing a PNG of a
   raw HLG frame produces near-black content (HLG 0.5 ≈ 18% scene
   reference). The renderer linearizes (HLG OETF inverse), rotates
   primaries (BT.2020 → BT.709), then applies the BT.709 OETF so the
-  PNG opens correctly in standard viewers. Reuses the QC path from
-  ``color_qc._normalize_for_analysis``.
+  PNG opens correctly in standard viewers. This mirrors the repo's
+  Resolve target: Rec.2100 HLG input to Rec.709 Gamma 2.4 SDR output.
 * **Downscaled.** Source is 4K. A 4K PNG is ~16 MB and slow to inspect
-  via Claude's Read tool. Downscale to 960×540 (DEFAULT_STILL_WIDTH)
+  via multimodal review tools. Downscale to 960×540 (DEFAULT_STILL_WIDTH)
   which is plenty for color judgment and keeps files ~200-400 KB.
 * **Mid-frame.** The midpoint of the clip is a reasonable scene-
   representative frame (avoids boundary artifacts like fade-ins, slates,
@@ -41,7 +38,6 @@ from typing import Any
 import cv2
 import numpy as np
 
-from piano_guard.color_qc import _normalize_for_analysis
 from piano_guard.config import SessionProjectConfig, iter_session_takes
 from piano_guard.ingest import probe_video
 from piano_guard.reports import Issue
@@ -50,9 +46,18 @@ from piano_guard.reports import Issue
 DEFAULT_STILL_WIDTH = 960
 """PNG width in pixels for still output. 960×540 is enough to see
 lighting regime / skin tone / reflection placement without being slow
-to transfer over Claude's multimodal Read tool."""
+to transfer over multimodal review tools."""
 
 STILLS_SUBDIR = "stills"
+
+BT2020_TO_BT709 = np.array(
+    [
+        [1.6605, -0.5876, -0.0728],
+        [-0.1246, 1.1329, -0.0083],
+        [-0.0182, -0.1006, 1.1187],
+    ],
+    dtype=np.float32,
+)
 
 
 @dataclass
@@ -66,6 +71,36 @@ class StillRenderResult:
     source_height: int
     mid_frame_index: int
     mid_frame_time_s: float
+    color_pipeline: str
+
+
+def _hlg_to_linear(values: np.ndarray) -> np.ndarray:
+    a = 0.17883277
+    b = 0.28466892
+    c = 0.55991073
+    return np.where(
+        values <= 0.5,
+        (values * values) / 3.0,
+        (np.exp((values - c) / a) + b) / 12.0,
+    ).astype(np.float32)
+
+
+def _bt709_oetf(values: np.ndarray) -> np.ndarray:
+    return np.where(
+        values < 0.018,
+        4.5 * values,
+        1.099 * np.power(np.maximum(values, 0.0), 0.45) - 0.099,
+    ).astype(np.float32)
+
+
+def _normalize_for_display(frame_rgb: np.ndarray, video: Any) -> np.ndarray:
+    rgb = np.clip(frame_rgb.astype(np.float32), 0.0, 1.0)
+    if video.color_transfer == "arib-std-b67":
+        rgb = _hlg_to_linear(rgb)
+    if video.color_primaries == "bt2020":
+        rgb = np.tensordot(rgb, BT2020_TO_BT709.T, axes=1)
+    rgb = np.clip(rgb, 0.0, 1.0)
+    return np.clip(_bt709_oetf(rgb), 0.0, 1.0)
 
 
 def _hlg_source_to_display_rgb(frame_bgr: np.ndarray, video) -> np.ndarray:
@@ -77,7 +112,7 @@ def _hlg_source_to_display_rgb(frame_bgr: np.ndarray, video) -> np.ndarray:
     """
     # cv2 decoded uint8 BGR → RGB float32
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    normalized = _normalize_for_analysis(frame_rgb.astype(np.float32) / 255.0, video)
+    normalized = _normalize_for_display(frame_rgb.astype(np.float32) / 255.0, video)
     # Convert back to uint8 PNG-ready
     return np.clip(normalized * 255.0, 0.0, 255.0).astype(np.uint8)
 
@@ -154,6 +189,7 @@ def render_clip_still(
             source_height=source_h,
             mid_frame_index=mid_idx,
             mid_frame_time_s=mid_time,
+            color_pipeline="sony_pp10_hlg_rec2100_to_sdr_rec709_gamma24",
         )
     finally:
         capture.release()
@@ -229,9 +265,9 @@ def preview_cdl_on_still(
 
     Closes the /color-review skill's feedback loop without a Resolve
     round-trip. The math is identical to what Resolve's SetCDL on Node 1
-    does when the project is set to YRGB Automatic SDR Rec.709
-    (Timeline = Rec.709 (Scene), so the CDL operates on the same
-    Rec.709-display space as the rendered still PNG).
+    does when the project is set to piano-guard's explicit SDR target
+    (Input = Rec.2100 HLG, Timeline/Output = Rec.709 Gamma 2.4), so the
+    CDL operates on the same Rec.709 display-review space as the PNG.
 
     Resolve's ``GalleryStillAlbum.ExportStills`` was attempted as the
     "true" preview source but consistently returns False on Resolve
@@ -246,8 +282,9 @@ def preview_cdl_on_still(
 
     Caveats:
       * Differs from the live Resolve viewer if the project's color
-        management changes (e.g. switches to DRCM v2 Custom). Verify
-        with the operator on a real apply if uncertain.
+        management drifts from the repo's explicit HLG→SDR settings.
+        `inspect-resolve-session` should be PASS/WARN with no
+        resolve_color_management_mismatch before trusting previews.
       * Operates on display-encoded sRGB pixels, NOT scene-linear. CDL
         math in display gamma is approximate but visually accurate
         enough for skill-level decisions.

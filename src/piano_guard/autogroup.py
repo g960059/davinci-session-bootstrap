@@ -178,11 +178,10 @@ def _resolve_incoming_dir(piece_root: Path, incoming_dir: str | None) -> tuple[s
             raise FileNotFoundError(f"incoming directory not found: {resolved}")
         return incoming_dir, resolved
 
-    for candidate in ("incoming", "incomings"):
-        resolved = (piece_root / candidate).resolve()
-        if resolved.is_dir():
-            return candidate, resolved
-    raise FileNotFoundError(f"no incoming directory found under {piece_root}; expected incoming/ or incomings/")
+    resolved = (piece_root / "incoming").resolve()
+    if resolved.is_dir():
+        return "incoming", resolved
+    raise FileNotFoundError(f"no incoming directory found under {piece_root}; expected incoming/")
 
 
 def _decode_audio_mono(path: Path) -> np.ndarray:

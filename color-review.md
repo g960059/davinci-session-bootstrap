@@ -1,204 +1,113 @@
-# Stage C — Cross-angle color review (closed loop)
+# Optional Color Review Aids
 
-Supporting file for `SKILL.md`. Read this when entering Stage C.
+This repo no longer treats AI CDL as the production color path. The standard
+workflow stops after Stage B and hands the session to the Resolve operator for
+manual multicam color work with Local Grades and Gallery Stills.
 
-You (Claude) look at rendered stills, compare angles, propose ASC CDLs,
-**preview each proposal offline before committing to Resolve**, and iterate
-until the visual matches the reference. The operator confirms at the end.
-
-**You are the vision + judgment layer. The CLI is the mechanical layer.**
-
-Commit target: a named remote version `auto-state-99-v1` on each clip's
-source pool item. `Version 1` (ungraded) is never touched, so the operator
-can always bypass.
-
-## Inputs required
-
-- A session root with `session.yaml` and `takes/take-XX/angle-*.mp4` —
-  produced by Stage A.
-- DaVinci Resolve running and the session's project open — produced by
-  Stage B.
-- Resolve project color management on **YRGB Auto SDR Rec.709** (Node 1 in
-  Rec.709 Scene). Stage B applies this; if the operator changed it,
-  preview-cdl's offline math will diverge from Resolve's actual application
-  — surface that and ask the operator to revert before committing.
-
-## Closed-loop workflow
-
-You drive the loop end-to-end. Operator only confirms at the end.
-
-### 1. Render stills (once per session)
+The commands below are still useful as review aids:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/pg" render-stills "<session-root>" --json
+pg render-stills "<session-root>" --json
+pg review-manifest "<session-root>" --json
+pg contact-sheet "<session-root>" --json
 ```
 
-Outputs `<session-root>/reports/stills/<take_id>/<angle>.png` (HLG → Rec.709
-SDR tonemapped, 960 px wide).
+They render stills, describe angle coverage, and create a contact sheet. They
+do not apply grades in Resolve.
 
-### 2. Identify the reference angle
+## Inputs
 
-Read `<session-root>/session.yaml` — `reference_angle` is set by Stage A
-(operator picked it as the WB anchor). If somehow null, ask the operator
-before proceeding rather than guessing.
+- `<session-root>/session.yaml`.
+- `<session-root>/takes/take-XX/angle-*.mp4`.
+- Resolve project prepared by Stage B.
+- Project color management left on the Stage B path:
+  `Rec.2100 HLG` input to `Rec.709 Gamma 2.4` timeline/output with
+  `DaVinci` input/output DRT.
 
-State the reference + reasoning in your reply, e.g.:
-> "Using `angle-b` as reference per session.yaml. Side-view has window
-> daylight grounding white-key WB; targets will be matched to it."
+## Review Use
 
-### 3. For each non-reference clip — closed-loop iteration
+`review-manifest` does not require a reference angle. It lists every rendered
+clip still for visual review. Use the contact sheet for fast session-wide
+scanning, then inspect individual stills as needed.
 
-```
-[3a] Read the source still: <session>/reports/stills/<take>/<angle>.png
-[3b] Read the reference still: <session>/reports/stills/<take>/<ref>.png
-[3c] Visually compare → propose slope+offset
-[3d] pg preview-cdl --source-png S --slope R,G,B --offset R,G,B --out preview.png
-[3e] Read the preview PNG with Read tool
-[3f] Compare preview to reference. Match? → goto 3g. Off? → revise, back to 3d.
-[3g] pg manual-cdl ... → Resolve writes auto-state-99-v1
-```
+Read `color-review-manifest.json.angle_summary`:
 
-Preview-cdl is ~100 ms per call and offline — iterate as many times as
-needed before committing.
+- `all_angles`: every angle label present anywhere in the session.
+- `common_angles`: angle labels present in every take.
+- `missing_by_take`: take-level camera coverage gaps.
 
-#### Visual analysis cheatsheet
+The contact sheet uses fixed angle columns from `all_angles`; rows do not shift
+when a take is missing an angle.
 
-When comparing target still to reference still:
+## Manual Resolve Color Policy
 
-- **White keys**: are target keys warmer (more R/yellow), cooler (more B),
-  dimmer, brighter? Estimate the per-channel ratio you'd need to multiply
-  target by to match reference. That's the slope.
-- **Piano body**: same question, but **discount reflections** mentally.
-  If > 30% of the body is reflection (window in shot behind piano), trust
-  white-key judgment more.
-- **Skin tones** (if pianist visible): warmer/cooler/redder?
-- **Overall luma**: target underexposed → offset > 0; overexposed → offset < 0.
+- Grade inside each multicam timeline after `Open in Timeline`.
+- Use Local Grades for the standard workflow.
+- Match angles within the same take first.
+- Use Gallery Stills as starting points for the next take.
+- Use the final piece timeline only for light take-to-take finishing.
 
-#### Conservative bounds
+Visual priorities:
 
-Start within these ranges; widen only with strong visual evidence:
+- White keys are the primary neutral reference.
+- Discount piano-body reflections when judging color.
+- Use skin tone only when visible and comparable.
+- Keep the black piano finish from crushing too hard.
+- Preserve a believable gold plate and wood floor color.
+- Do not force exact sameness across takes when sunlight naturally changes.
+- Do not neutralize the whole session to an imagined D65 target.
 
-- `slope` per channel: **0.85 – 1.15** for typical cross-angle drift.
-- `offset` per channel: **−0.02 to 0.02**.
+## Experimental CDL Commands
 
-Wider slopes (>1.5 or <0.7) tend to clip highlights or crush shadows.
-Don't propose those.
+`preview-cdl` and `manual-cdl` are retained for debugging older sessions and
+small CDL experiments. They are not part of the standard skill workflow.
 
-#### Stopping the loop
-
-Stop iterating preview-cdl when:
-
-- Preview's white keys roughly match reference's white keys (visually
-  equivalent is enough — not pixel parity).
-- Preview's overall cast aligns with reference (no obvious R/G/B push).
-- Preview's skin / body tones don't look broken.
-
-Then call manual-cdl to commit. **Don't iterate forever** — 3–5 preview
-cycles per clip is the practical limit.
-
-### 4. Commit via manual-cdl
+Commit target: remote version `auto-state-99-v1` on the source MediaPoolItem.
+`Version 1` is never touched.
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/pg" manual-cdl "<session-root>" \
+pg preview-cdl --source-png still.png \
+  --slope 1,1,1 \
+  --offset 0,0,0 \
+  --out preview.png \
+  --json
+
+pg manual-cdl "<session-root>" \
   --clip-id "take-04/angle-c" \
-  --slope "1.08,0.95,1.18" \
-  --offset "0.02,0.0,-0.01" \
+  --slope "1,1,1" \
+  --offset "0,0,0" \
+  --dry-run \
   --json
 ```
 
-Writes to `auto-state-99-v1` remote version. Verify the JSON:
-- `applied[0].setcdl_rc` must be `true`
-- `tools_present` includes `Primary Balance`
+`manual-cdl` only writes CDL values to the named remote version. It does not
+change the project-wide HLG -> SDR transform. Identity CDL must therefore look
+the same as the corrected base image. If the base image is clipped, yellow, or
+otherwise broken, fix Resolve color management first instead of expecting
+`auto-state-99-v1` to repair it.
 
-If skipped, the reason field tells you why (e.g. `multicam_exists` →
-need to apply before multicam creation; `clip_not_found` → Stage B
-hasn't run for this clip).
+Normal CDL experiment bounds:
 
-### 5. Final operator verification
+- `slope`: `0.90` to `1.10`.
+- `offset`: `-0.02` to `0.02`.
 
-After all clips committed, briefly summarize what you applied:
+Anything beyond that should be done manually in Resolve, not pushed through
+CDL automation.
 
-```
-Take 01:
-  angle-b → identity (reference)
-  angle-c → slope [0.91, 0.98, 1.06] (cool the warm tungsten cast)
-  angle-d → slope [0.95, 0.99, 1.04] (subtle cool)
+## Failure Handling
 
-Take 04:
-  angle-b → slope [1.05, 0.97, 1.01]
-  ...
-```
+- `still_missing`: rerun `render-stills`; if the source clip is missing, fix the
+  take directory first.
+- `multicam_exists`: `manual-cdl` is too late for that project state. Use manual
+  Resolve grading inside the multicam timeline.
+- `clip_not_found`: rerun Stage B so source clips are present in the Media Pool.
 
-Then ask the operator to load each clip's `auto-state-99-v1` in Resolve's
-Color page (right-click thumbnail → Remote Versions → auto-state-99-v1 →
-Load) and confirm the look.
+## CLI Reference
 
-If the operator pushes back on a specific clip ("take-03/angle-c is still
-too warm"), iterate via preview-cdl again, then re-apply manual-cdl on
-that one clip. Don't redo clips the operator accepted.
-
-## Design principles to respect
-
-- **Every grade is a starter draft.** The operator opens Resolve and
-  tweaks. Primary Balance via SetCDL is editable; LUTs are opaque — never
-  propose LUTs from this stage.
-- **Write only to named remote versions.** Never touch `Version 1` (the
-  ungraded source). Always commit to `auto-state-99-v1` so the operator
-  can bypass.
-- **One session per Stage C invocation.** Don't batch across sessions —
-  each has its own reference + lighting context.
-- **Explain your judgment.** When proposing a CDL, say what you're
-  correcting for ("reducing B slope to balance against sky in angle-d
-  reflection"). Helps the operator catch systematic errors and trust
-  your calls over time.
-
-## Common pitfalls
-
-- **Mistaking reflections for content.** Piano lid mirrors windows, sheet
-  music, pianist's face. When judging body color, discount reflective
-  regions; rely on white keys more if the body is mostly reflection.
-- **Over-correcting shadows.** HLG 8-bit linearized blacks are noisy
-  around luma 0.005–0.02. Don't chase shadow color precision; the data
-  isn't there.
-- **Matching to a wrong reference.** If the reference angle is itself
-  off-neutral (e.g. warm tungsten room), don't try to neutralize it to
-  D65. Match targets to it as-is. The operator can apply a creative WB
-  layer on top in post.
-- **Day vs night propagation.** A grade fit on a day take ≠ the right
-  grade for a night take of the same angle. Treat them as separate
-  sub-sessions; pick a reference per regime if needed.
-- **Trusting preview-cdl when project color management isn't aligned.**
-  If the operator's project is NOT YRGB Auto SDR Rec.709, the offline
-  preview's CDL math diverges from Resolve's actual application. Flag
-  this and ask the operator to verify directly in Resolve before
-  committing.
-
-## Escape hatches
-
-- **Iteration not converging?** After 5 preview cycles without visually
-  matching the reference, stop. Either:
-  (a) The reference itself is content-mismatched (different scene, not
-      just different angle) — pick a more comparable reference.
-  (b) The target needs a transform CDL can't express (cross-channel
-      matrix, non-linear curve). Mark the clip as "needs manual Resolve
-      grading" and move on.
-- **Identity reset.** To clear an `auto-state-99-v1` grade, manual-cdl
-  with `--slope 1,1,1 --offset 0,0,0`. Operator can also reset via
-  Color page Node 1 → Reset Node Grade.
-- **Pre-existing pipeline grades.** Some sessions may carry
-  `auto-state-NN-v1` versions from legacy `auto-color-normalize` runs.
-  They coexist with `auto-state-99-v1` and the operator A/Bs in the
-  Versions panel — leave them alone unless asked to clean up.
-
-## CLI reference
-
-All commands are idempotent. Output JSON reports live in
-`<session-root>/reports/`.
-
+- `pg inspect-resolve-session <session-root> [--json]`
+- `pg operator-handoff <session-root> [--json]`
 - `pg render-stills <session-root> [--width N] [--json]`
+- `pg review-manifest <session-root> [--json]`
+- `pg contact-sheet <session-root> [--out path.png] [--json]`
 - `pg preview-cdl --source-png S --slope R,G,B --offset R,G,B --out preview.png [--json]`
 - `pg manual-cdl <session-root> --clip-id X --slope R,G,B --offset R,G,B [--dry-run] [--json]`
-- `pg grab-still <session-root> --clip-id X --out path.png [--version-name V] [--json]`
-  — Drives Resolve to render the actual graded viewer frame.
-  **Broken on Resolve 20.3.2** (ExportStills returns False; tracked but
-  not fixed). Use `preview-cdl` for the offline equivalent until then.

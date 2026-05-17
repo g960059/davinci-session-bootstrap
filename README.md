@@ -1,124 +1,177 @@
-# davinci-session-bootstrap skill
+# davinci-session-bootstrap
 
-User-global Claude Code skill that wraps the piano-guard CLI to bootstrap
-a new piano session in DaVinci Resolve, end to end.
+DaVinci Resolve session bootstrap for multi-camera piano recordings. This
+repository is self-contained: the bundled `piano-guard` CLI in
+`src/piano_guard/` is the canonical implementation for this skill.
 
-Invoke from any directory in Claude Code:
+The standard workflow now stops at a manual Resolve handoff. Color and
+editorial work happen in Resolve with multicam timelines, Local Grades, and
+Gallery Stills.
 
-```
-/davinci-session-bootstrap <session-root>
-```
+For the full operational workflow, see [WORKFLOW.md](WORKFLOW.md).
 
-The skill reads `SKILL.md` and walks Claude through three stages:
+## Scope
 
-1. **group-session** — `incoming/*.mp4 + audio.{wav,aif,...}` → `takes/take-XX/`.
-2. **prepare-resolve-session** — create / open Resolve project, generate
-   audio-edit proxies, waveform-sync each take.
-3. **AI cross-angle color review** — render stills, propose per-clip CDLs,
-   preview offline, commit to `auto-state-99-v1` in Resolve. Detail lives
-   in `color-review.md` (loaded on demand).
+In scope:
 
-Operator can opt out of stage 3 per session ("skip color" / 「色は手動でやる」).
+- Auto-grouping `incoming/` media into takes.
+- Resolve project bootstrap and waveform sync.
+- Audio edit proxy generation when needed.
+- Resolve cache, gallery stills, and project backup storage preflight.
+- Sony α6400 PP10 HLG -> YouTube SDR Rec.709 project color management.
+- Project inspection and `reports/operator-handoff.md`.
+- Optional still/contact-sheet generation for manual review.
 
-## First-time setup
+Out of scope:
 
-The skill bundles its own copy of piano-guard inside this directory.
-You must build the venv once:
+- Automatic color matching.
+- Standard use of `auto-state-99-v1` / Remote Versions.
+- AI CDL autopilot as a production path.
+- LUT delivery.
+- Logic Pro automation.
+- Final multicam editing, manual color grading, and export decisions.
 
-```bash
-~/.claude/skills/davinci-session-bootstrap/scripts/install.sh
-```
+## First-Time Setup
 
-This requires:
-
-- `uv` (https://docs.astral.sh/uv/, or `brew install uv`)
-- Python 3.11 available on the system
-- About 3 GB of disk for the bundled torch / opencv / sam2 wheels
-- Internet access on first install (later runs are offline)
-
-The build takes 1–3 minutes on a fresh machine.
-
-## Updating the bundled CLI
-
-When piano-guard upstream changes:
+Build the local virtualenv once:
 
 ```bash
-~/.claude/skills/davinci-session-bootstrap/scripts/sync-from-source.sh
-~/.claude/skills/davinci-session-bootstrap/scripts/install.sh   # only if pyproject.toml or uv.lock changed
+./scripts/install.sh
 ```
 
-`sync-from-source.sh` reads from `~/ghq/github.com/g960059/davinci-automation`
-by default. Override with `PIANO_GUARD_SRC=/path/to/repo` if your local
-clone lives elsewhere.
+Requirements:
 
-The editable install picks up Python source edits without re-running
-install.sh — only re-install when dependency metadata changes.
+- `uv` (`brew install uv`)
+- Python 3.11
+- DaVinci Resolve scripting enabled for Resolve-backed commands
+- `ffmpeg` / `ffprobe` available on `PATH`
 
-## The `.venv` is a disposable cache
+The `.venv/` directory is a disposable machine-local cache. Re-run
+`scripts/install.sh` after Python, macOS, Homebrew, or dependency changes.
 
-`scripts/install.sh` creates `.venv/` with all bundled dependencies. This
-directory is **not** durable:
+## Session Layout
 
-- After macOS / Homebrew / Python upgrades, the venv's interpreter
-  symlink may break. Re-run `install.sh` to rebuild.
-- Do not check `.venv/` into git or sync it via Dropbox / iCloud — it is
-  machine-local and large (~3 GB).
-- If `scripts/pg --help` ever fails, the first thing to try is re-running
-  `install.sh`.
+Before bootstrap:
 
-## What the skill expects on disk
-
-For a new session at `<session-root>` (e.g. `/Volumes/PortableSSD/my-session/`):
-
-```
+```text
 <session-root>/
-├── incoming/
-│   ├── <camera files>.mp4     # one per (take, angle) — at least one
-│   └── audio.wav              # Logic Pro bounce or sync-recorder; required
-└── (everything else is created by the skill)
+└── incoming/
+    ├── <camera files>.mp4
+    └── <audio files>.aif
 ```
 
 After bootstrap:
 
-```
+```text
 <session-root>/
-├── incoming/                  # emptied; files moved into takes/ or excluded/
-├── session.yaml               # session-level config including reference_angle
+├── incoming/
+├── session.yaml
 ├── takes/
 │   └── take-XX/
 │       ├── angle-X.mp4
-│       ├── audio.wav          # original
-│       ├── audio-edit.wav     # 48 kHz / 24-bit proxy for Resolve sync
+│       ├── audio.aif
+│       ├── audio-edit.wav
 │       └── take.yaml
 ├── reports/
 │   ├── prepare-resolve-session.json
-│   ├── stills/                # Stage C: per-clip PNGs (HLG→Rec.709 tonemapped)
-│   │   └── <take>/<angle>.png
-│   └── manual-cdl.json        # Stage C: CDLs committed to Resolve
-└── resolve/                   # .drp snapshot of the bootstrapped project
+│   ├── inspect-resolve-session.json
+│   ├── operator-handoff.md
+│   ├── operator-handoff.json
+│   ├── render-stills.json
+│   ├── color-review-manifest.json
+│   ├── color-review-sheet.png
+│   └── stills/<take>/<angle>.png
+└── resolve/
+    └── <project>.drp
 ```
 
-## Scope
+## Standard Pipeline
 
-In scope (Stage C):
+Run directly from this checkout:
 
-- **Color review** (per-clip Primary Balance / CDL). Operator can opt out
-  per session if they want to grade manually in Resolve.
+```bash
+./scripts/pg group-session "<session-root>" --json
+./scripts/pg prepare-resolve-session "<session-root>" --json
+./scripts/pg inspect-resolve-session "<session-root>" --json
+./scripts/pg operator-handoff "<session-root>" --json
+```
 
-Out of scope:
+`prepare-resolve-session` writes `operator-handoff.md` automatically when it
+completes successfully. Running `operator-handoff` separately is useful after
+manual changes to `session.yaml` or take metadata.
 
-- **Editorial assembly**: multicam clips, Session_Assembly timeline,
-  Piece_* timelines remain manual operations in Resolve.
-- **Logic Pro automation**: piano-guard reads the `.logicx` path as a
-  sidecar reference but does not drive Logic Pro.
-- **Auto-installation**: the operator runs `install.sh` once; the skill
-  never silently runs network/build inside a Claude turn.
-- **LUT-based grading**: by design only Primary Balance / CDL is written
-  to Resolve, since LUTs are opaque and not operator-editable.
+Expected Resolve color management:
 
-## Source of the vendored CLI
+```text
+Color science: DaVinci YRGB Color Managed
+Automatic color management: Off
+Input color space: Rec.2100 HLG
+Timeline color space: Rec.709 Gamma 2.4
+Output color space: Rec.709 Gamma 2.4
+Input DRT: DaVinci
+Output DRT: DaVinci
+```
 
-The bundled `src/piano_guard/` is a copy of
-`~/ghq/github.com/g960059/davinci-automation/src/piano_guard/` at the time
-of the last `sync-from-source.sh` run. Check the upstream repo for the
-canonical source and tests.
+`timelinePlaybackFrameRate=24` on a 29.97 project is reported as a warning
+because Resolve scripting cannot reliably change it; fix it manually before
+editorial assembly or export.
+
+## Optional Review Aids
+
+These commands create review materials only. They do not write grades into
+Resolve.
+
+```bash
+./scripts/pg render-stills "<session-root>" --json
+./scripts/pg review-manifest "<session-root>" --json
+./scripts/pg contact-sheet "<session-root>" --json
+```
+
+Use the contact sheet to check angle coverage and broad color/exposure issues
+before manual grading.
+
+## Manual Resolve Workflow
+
+After bootstrap:
+
+1. In Resolve, create one multicam clip per take from all angle videos plus the
+   final external audio.
+2. Use `Sound` sync.
+3. Right-click the multicam clip and choose `Open in Timeline`.
+4. Confirm sync, then disable or delete camera scratch audio. Keep only the
+   external AIF/WAV audio for final use.
+5. On the Color page, use Local Grades inside the multicam timeline.
+6. Match angles within the same take first.
+7. Save angle grades as Gallery Stills and use them as starting points for the
+   next take.
+8. Assemble the graded multicam clips into the piece timeline.
+9. Perform angle switching and final edit.
+10. Use final timeline grades only for light take-to-take finishing.
+
+## Experimental CDL Tools
+
+The CLI still contains `preview-cdl` and `manual-cdl` for older experiments and
+debugging. They are hidden from normal help and are not part of the standard
+workflow.
+
+```bash
+./scripts/pg preview-cdl --source-png still.png --slope 1,1,1 --offset 0,0,0 --out preview.png --json
+./scripts/pg manual-cdl "<session-root>" --clip-id take-01/angle-c --slope 1,1,1 --offset 0,0,0 --dry-run --json
+```
+
+`manual-cdl` writes only CDL values on the named remote version. Identity CDL
+does not change the image; the project-wide HLG -> SDR base transform must be
+correct before any CDL experiment is meaningful.
+
+## E2E Test Session
+
+The historical E2E fixture was:
+
+```bash
+/Volumes/PortableSSD/phase2-e2e-test
+```
+
+For current validation, prefer creating a fresh session with `incoming/`, then
+run the standard pipeline. Optional still/contact-sheet checks may be run after
+Stage B. Ignore legacy auto-color reports and LUT artifacts if they exist in an
+old fixture.

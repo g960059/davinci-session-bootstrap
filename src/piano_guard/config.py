@@ -25,7 +25,7 @@ class TimelineConfig:
     width: int = 3840
     height: int = 2160
     input_color_space: str = "Rec.2100 HLG"
-    timeline_color_space: str = "DaVinci WG/Intermediate"
+    timeline_color_space: str = "Rec.709 Gamma 2.4"
     output_color_space: str = "Rec.709 Gamma 2.4"
 
 
@@ -55,56 +55,6 @@ class ValidationConfig:
 @dataclass
 class LogicConfig:
     project_file: str | None = None
-
-
-@dataclass
-class CalibrationBox:
-    """A rectangular ROI on a calibration frame, in absolute pixel coordinates.
-
-    Coordinates match what `cv2.selectROIs` returns: (x, y, w, h) where (x, y)
-    is the top-left corner and (w, h) are the box dimensions.
-    """
-
-    x: int
-    y: int
-    w: int
-    h: int
-
-
-@dataclass
-class AngleCalibration:
-    """Per-angle calibration: operator-drawn boxes on white keys and piano body."""
-
-    white_key_boxes: list[CalibrationBox] = field(default_factory=list)
-    piano_body_boxes: list[CalibrationBox] = field(default_factory=list)
-
-
-@dataclass
-class CalibrationFrameSource:
-    """Where the calibration frame came from — enables re-annotation using the
-    same reference frame if the operator wants to adjust boxes.
-    """
-
-    take_id: str
-    frame_index: int
-    frame_position: float  # normalized position within the clip [0, 1]
-
-
-@dataclass
-class SessionCalibration:
-    """A session-wide calibration record created by `piano-guard calibrate`.
-
-    The reference angle is validated against data-quality checks (no clipping,
-    above noise floor, adequate W/B separation) by the `calibrate` subcommand
-    before the record is written. If any check fails, the subcommand FAILs and
-    the file is not written.
-    """
-
-    session: str
-    calibrated_at: str  # ISO 8601 timestamp
-    reference_angle: str
-    frame_source: CalibrationFrameSource
-    angles: dict[str, AngleCalibration] = field(default_factory=dict)
 
 
 @dataclass
@@ -192,13 +142,6 @@ class SessionProjectConfig:
 
     def resolve_snapshot_path(self) -> Path:
         return self.resolve_snapshot_dir() / f"{self.resolve.project_name}.drp"
-
-    def calibration_file_path(self) -> Path:
-        """Location of the per-session calibration YAML produced by
-        `piano-guard calibrate`. The file is outside the Resolve Project
-        Library so it survives `--fresh` project recreation.
-        """
-        return self.session_root / "calibration.yaml"
 
 
 def project_name_for_path(path: Path) -> str:
@@ -375,64 +318,6 @@ def load_session(session_path: str | Path) -> SessionProjectConfig:
     )
 
 
-def calibration_to_dict(calibration: SessionCalibration) -> dict[str, Any]:
-    """Serialize a SessionCalibration to a YAML-friendly dict."""
-    return {
-        "session": calibration.session,
-        "calibrated_at": calibration.calibrated_at,
-        "reference_angle": calibration.reference_angle,
-        "frame_source": {
-            "take_id": calibration.frame_source.take_id,
-            "frame_index": calibration.frame_source.frame_index,
-            "frame_position": calibration.frame_source.frame_position,
-        },
-        "angles": {
-            angle_id: {
-                "white_key_boxes": [[b.x, b.y, b.w, b.h] for b in ac.white_key_boxes],
-                "piano_body_boxes": [[b.x, b.y, b.w, b.h] for b in ac.piano_body_boxes],
-            }
-            for angle_id, ac in calibration.angles.items()
-        },
-    }
-
-
-def calibration_from_dict(data: dict[str, Any]) -> SessionCalibration:
-    """Inverse of calibration_to_dict. Raises KeyError for structurally invalid input."""
-    frame_source_raw = data["frame_source"]
-    angles: dict[str, AngleCalibration] = {}
-    for angle_id, angle_data in (data.get("angles") or {}).items():
-        angles[angle_id] = AngleCalibration(
-            white_key_boxes=[CalibrationBox(*box) for box in angle_data.get("white_key_boxes", [])],
-            piano_body_boxes=[CalibrationBox(*box) for box in angle_data.get("piano_body_boxes", [])],
-        )
-    return SessionCalibration(
-        session=data["session"],
-        calibrated_at=data["calibrated_at"],
-        reference_angle=data["reference_angle"],
-        frame_source=CalibrationFrameSource(
-            take_id=frame_source_raw["take_id"],
-            frame_index=int(frame_source_raw["frame_index"]),
-            frame_position=float(frame_source_raw["frame_position"]),
-        ),
-        angles=angles,
-    )
-
-
-def write_calibration(calibration: SessionCalibration, path: Path) -> Path:
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(calibration_to_dict(calibration), handle, allow_unicode=True, sort_keys=False)
-    return path
-
-
-def load_calibration(path: Path) -> SessionCalibration:
-    path = Path(path).resolve()
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
-    return calibration_from_dict(data)
-
-
 def discover_logic_project(session_root: Path) -> str | None:
     candidates: list[Path] = []
     logic_dir = session_root / "logic"
@@ -496,6 +381,15 @@ def initialize_session(
     if project_library_name is not None:
         session.resolve.project_library_name = project_library_name
     session.logic.project_file = discover_logic_project(session_root) or session.logic.project_file
+    # This repo is intentionally scoped to Sony α6400 PP10 HLG source and
+    # YouTube SDR delivery. Older sessions may still carry the previous
+    # DaVinci WG/Intermediate timeline value; migrate them when the session
+    # config is normalized so Resolve, still rendering, and CDL preview use
+    # one explicit HLG -> Rec.709 path.
+    defaults = TimelineConfig()
+    session.timeline.input_color_space = defaults.input_color_space
+    session.timeline.timeline_color_space = defaults.timeline_color_space
+    session.timeline.output_color_space = defaults.output_color_space
 
     takes_root = session_root / "takes"
     if not takes_root.is_dir():

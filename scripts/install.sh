@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the skill's .venv from the vendored piano-guard source.
-# Run once after sync-from-source.sh, then again whenever pyproject.toml or uv.lock changes.
+# Build the skill's .venv from this repository's piano-guard source.
+# Run once, then again whenever pyproject.toml or uv.lock changes.
 # The .venv is a disposable cache; re-run after Python/macOS upgrades if it stops working.
 set -euo pipefail
 
@@ -8,7 +8,7 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 
 if [[ ! -f pyproject.toml ]]; then
-  echo "error: pyproject.toml not found in $DIR. Run scripts/sync-from-source.sh first." >&2
+  echo "error: pyproject.toml not found in $DIR." >&2
   exit 1
 fi
 
