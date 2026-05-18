@@ -32,6 +32,8 @@ NULL_ASSIGNMENT_SCORE = 0.40
 MIN_LANE_ASSIGNMENT_SCORE = 0.56
 MIN_PRODUCTION_TAKE_SCORE = 0.60
 MAX_ASSET_GAP_SECONDS = 240.0
+OVERMERGED_LANE_DISTANCE = 0.28
+LANE_COUNT_PREFERENCE_TOLERANCE = 0.15
 
 
 @dataclass
@@ -567,6 +569,7 @@ def _candidate_objective(
     unassigned_count = sum(len(result.unassigned_videos) for result in lane_results)
     single_lane_penalty = sum(1 for result in lane_results if len(result.lane.videos) == 1) * 0.35
     lane_size_penalty = sum(max(0, len(result.lane.videos) - len(audio_assignments)) * 0.15 for result in lane_results)
+    overmerged_penalty = sum(max(0.0, _lane_visual_spread(result.lane) - OVERMERGED_LANE_DISTANCE) * 1.2 for result in lane_results)
     assignment_scores = [assignment.metrics.pair_score for result in lane_results for assignment in result.assignments]
     average_assignment = float(np.mean(assignment_scores)) if assignment_scores else 0.0
     return (
@@ -578,8 +581,31 @@ def _candidate_objective(
         - (unassigned_count * 0.4)
         - single_lane_penalty
         - lane_size_penalty
-        - (len(lane_results) * 0.18)
+        - overmerged_penalty
+        - (len(lane_results) * 0.06)
     )
+
+
+def _lane_visual_spread(lane: _LaneCluster) -> float:
+    descriptors = [video.descriptor for video in lane.videos if video.descriptor is not None]
+    if len(descriptors) <= 1:
+        return 0.0
+    spread = 0.0
+    for index, left in enumerate(descriptors):
+        for right in descriptors[index + 1 :]:
+            spread = max(spread, float(np.clip(1.0 - max(_visual_similarity(left, right), 0.0), 0.0, 1.0)))
+    return spread
+
+
+def _candidate_production_take_count(candidate: _CandidatePlan) -> int:
+    count = 0
+    for assignments in candidate.audio_assignments.values():
+        if not assignments:
+            continue
+        confidence = float(np.mean([assignment.metrics.pair_score for assignment in assignments]))
+        if 3 <= len(assignments) <= 4 and confidence >= MIN_PRODUCTION_TAKE_SCORE:
+            count += 1
+    return count
 
 
 def _classify_candidate(
@@ -703,7 +729,12 @@ def _choose_lane_candidate(audio_assets: list[_AudioAsset], video_assets: list[_
         if candidate.objective > best_candidate.objective + 1e-6:
             best_candidate = candidate
             continue
-        if abs(candidate.objective - best_candidate.objective) <= 1e-6 and candidate.lane_count < best_candidate.lane_count:
+        if (
+            candidate.objective >= best_candidate.objective - LANE_COUNT_PREFERENCE_TOLERANCE
+            and candidate.lane_count > best_candidate.lane_count
+            and len(candidate.unresolved_media) <= len(best_candidate.unresolved_media)
+            and _candidate_production_take_count(candidate) >= _candidate_production_take_count(best_candidate)
+        ):
             best_candidate = candidate
 
     return best_candidate
@@ -940,29 +971,71 @@ def write_auto_group_plan_reports(piece_root: str | Path, plan: AutoGroupPlan) -
     json_path = piece_root / "reports" / "auto-group-plan.json"
     markdown_path = piece_root / "reports" / "auto-group-plan.md"
     write_json_report(json_path, payload)
-    write_markdown_report(
-        markdown_path,
-        title="Auto Group Plan",
-        status=plan.status,
-        issues=plan.issues,
-        sections={
-            "Angles": plan.angles or ["not available"],
-            "Takes": [
-                f"{take.take_id}: {Path(take.audio_source).name} + {len(take.videos)} videos (confidence {take.confidence:.3f})"
-                for take in plan.takes
-            ],
-            "Excluded Media": [
-                f"{entry.media_type}: {Path(entry.source).name} ({entry.reason}, confidence {entry.confidence:.3f})"
-                for entry in plan.excluded_media
-            ]
-            or ["none"],
-            "Unresolved Media": [
-                f"{entry.media_type}: {Path(entry.source).name} ({entry.reason}, confidence {entry.confidence:.3f})"
-                for entry in plan.unresolved_media
-            ]
-            or ["none"],
-        },
+    lines = [
+        "# Auto Group Plan",
+        "",
+        f"- Status: {plan.status}",
+        f"- Generated at: {datetime.now(timezone.utc).isoformat()}",
+        f"- Incoming: `{plan.incoming_dir}`",
+        f"- Angles: {', '.join(plan.angles) if plan.angles else 'not available'}",
+        f"- Takes: {len(plan.takes)}",
+        "",
+        "## Take Summary",
+        "",
+        "| Take | Audio | Videos | Confidence | Labels |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for take in plan.takes:
+        labels = ", ".join(video.angle for video in take.videos)
+        lines.append(
+            f"| {take.take_id} | {Path(take.audio_source).name} | {len(take.videos)} | "
+            f"{take.confidence:.3f} | {labels} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Angle Labeling",
+            "",
+            "| Take | Angle | Lane | Source | Target | Pair | Waveform | Duration | Visual | Offset Seconds |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
     )
+    for take in plan.takes:
+        for video in take.videos:
+            visual = "" if video.visual_score is None else f"{video.visual_score:.3f}"
+            lines.append(
+                f"| {take.take_id} | {video.angle} | {video.lane_id} | {Path(video.source).name} | "
+                f"{video.target} | {video.pair_score:.3f} | {video.waveform_score:.3f} | "
+                f"{video.duration_score:.3f} | {visual} | {video.estimated_offset_seconds:.3f} |"
+            )
+
+    if plan.issues:
+        lines.extend(["", "## Issues", "", "| Severity | Code | Message |", "| --- | --- | --- |"])
+        for issue in plan.issues:
+            message = issue.message.replace("|", "\\|")
+            lines.append(f"| {issue.severity} | {issue.code} | {message} |")
+
+    lines.extend(["", "## Excluded Media", ""])
+    if plan.excluded_media:
+        lines.extend(
+            f"- {entry.media_type}: `{entry.source}` ({entry.reason}, confidence {entry.confidence:.3f})"
+            for entry in plan.excluded_media
+        )
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Unresolved Media", ""])
+    if plan.unresolved_media:
+        lines.extend(
+            f"- {entry.media_type}: `{entry.source}` ({entry.reason}, confidence {entry.confidence:.3f})"
+            for entry in plan.unresolved_media
+        )
+    else:
+        lines.append("- none")
+    lines.append("")
+    markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    markdown_path.write_text("\n".join(lines), encoding="utf-8")
     return json_path, markdown_path
 
 

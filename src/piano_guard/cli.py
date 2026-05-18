@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
@@ -9,7 +10,12 @@ import sys
 from typing import Any, Callable
 
 from piano_guard.audio_prep import prepare_session_audio, session_audio_prep_to_dict
-from piano_guard.autogroup import apply_auto_group, auto_group_plan_to_dict, plan_auto_group
+from piano_guard.autogroup import (
+    apply_auto_group,
+    auto_group_plan_to_dict,
+    plan_auto_group,
+    write_auto_group_plan_reports,
+)
 from piano_guard.config import (
     AUDIO_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -27,6 +33,7 @@ from piano_guard.resolve_ops import (
     ensure_resolve_storage_locations,
     ensure_resolve_running,
     inspect_resolve_session,
+    verify_resolve_session_after_reload,
 )
 from piano_guard.review import (
     MANUAL_CDL_VERSION_NAME,
@@ -61,6 +68,208 @@ def _fold_status(current: str, new: str | None) -> str:
     if new_rank > current_rank:
         return new or current
     return current
+
+
+def _markdown_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _markdown_table(headers: list[str], rows: list[list[Any]]) -> list[str]:
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _header in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(_markdown_value(value) for value in row) + " |")
+    return lines
+
+
+def _stage_rows(payload: dict[str, Any]) -> list[list[Any]]:
+    rows = []
+    for name, stage in (payload.get("stages") or {}).items():
+        if isinstance(stage, dict):
+            rows.append([name, stage.get("status", ""), stage.get("summary", "")])
+    return rows
+
+
+def _issue_rows(payload: dict[str, Any]) -> list[list[Any]]:
+    rows = []
+    for issue in payload.get("issues") or []:
+        if isinstance(issue, dict):
+            rows.append([issue.get("severity", ""), issue.get("code", ""), issue.get("message", "")])
+    for stage_name, stage in (payload.get("stages") or {}).items():
+        if not isinstance(stage, dict):
+            continue
+        for issue in stage.get("issues") or []:
+            if isinstance(issue, dict):
+                rows.append([
+                    issue.get("severity", ""),
+                    f"{stage_name}:{issue.get('code', '')}",
+                    issue.get("message", ""),
+                ])
+    return rows
+
+
+def _format_color_prep_take_rows(color_prep: dict[str, Any]) -> list[list[Any]]:
+    rows = []
+    for take in color_prep.get("takes") or []:
+        angle_parts = []
+        for angle in take.get("angles") or []:
+            if not isinstance(angle, dict):
+                continue
+            label = angle.get("angle", "")
+            track = angle.get("track_index", "")
+            start = angle.get("record_frame", angle.get("start_frame", ""))
+            confidence = angle.get("sync_confidence")
+            suffix = f", conf {confidence}" if confidence is not None else ""
+            angle_parts.append(f"{label}@V{track} start {start}{suffix}")
+        rows.append(
+            [
+                take.get("take_id", ""),
+                take.get("marker_frame", ""),
+                (take.get("audio") or {}).get("record_frame", take.get("audio_start", "")),
+                ", ".join(angle_parts),
+            ]
+        )
+    return rows
+
+
+def _write_prepare_markdown(session: Any, payload: dict[str, Any]) -> Path:
+    path = session.reports_path("prepare-resolve-session.md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bootstrap = (payload.get("stages") or {}).get("bootstrap") or {}
+    color_prep = bootstrap.get("color_prep") or {}
+    post_reload = (payload.get("stages") or {}).get("post_reload_verification") or {}
+    post_reload_color = post_reload.get("color_prep_timeline") or {}
+    lines = [
+        "# Prepare Resolve Session",
+        "",
+        f"- Status: {payload.get('status', '')}",
+        f"- Generated at: {datetime.now(timezone.utc).isoformat()}",
+        f"- Session: `{session.session_root}`",
+        f"- Resolve project: `{session.resolve.project_name}`",
+        "",
+        "## Operator Check",
+        "",
+        f"- Open `{session.resolve.color_prep_timeline_name}`.",
+        "- Confirm timeline start timecode is `00:00:00;00`.",
+        "- Use `compact-v1`, `compact-v2`, ... as packed rows.",
+        "- Grade by each clip item's `angle-*` label, not by track name.",
+        "- Camera scratch audio is not placed; A1 is `master-audio` only.",
+        "",
+        "## Stages",
+        "",
+        *_markdown_table(["Stage", "Status", "Summary"], _stage_rows(payload) or [["(none)", "", ""]]),
+        "",
+        "## Color Prep Created",
+        "",
+        *_markdown_table(
+            ["Field", "Value"],
+            [
+                ["timeline", color_prep.get("timeline_name", "")],
+                ["layout", color_prep.get("layout", "")],
+                ["start_timecode", color_prep.get("start_timecode", "")],
+                ["angles", ", ".join(color_prep.get("angles") or [])],
+                ["video_tracks", color_prep.get("max_video_tracks", "")],
+                ["take_count", color_prep.get("take_count", "")],
+            ],
+        ),
+        "",
+        "## Post-Reload Verification",
+        "",
+        *_markdown_table(
+            ["Field", "Value"],
+            [
+                ["status", post_reload.get("status", "")],
+                ["closed_project", post_reload.get("closed_project", "")],
+                ["reloaded_project", post_reload.get("reloaded_project", "")],
+                ["start_timecode", post_reload_color.get("start_timecode", "")],
+                ["video_track_count", post_reload_color.get("video_track_count", "")],
+                ["audio_track_count", post_reload_color.get("audio_track_count", "")],
+                ["markers", len(post_reload_color.get("markers") or {})],
+            ],
+        ),
+        "",
+        "## Take Placement",
+        "",
+        *_markdown_table(
+            ["Take", "Marker Frame", "Audio Start", "Angles"],
+            _format_color_prep_take_rows(color_prep) or [["(none)", "", "", ""]],
+        ),
+    ]
+    issue_rows = _issue_rows(payload)
+    if issue_rows:
+        lines.extend(["", "## Issues", "", *_markdown_table(["Severity", "Code", "Message"], issue_rows)])
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _write_inspect_markdown(session: Any, payload: dict[str, Any]) -> Path:
+    path = session.reports_path("inspect-resolve-session.md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    color_prep = payload.get("color_prep_timeline") or {}
+    lines = [
+        "# Inspect Resolve Session",
+        "",
+        f"- Status: {payload.get('status', '')}",
+        f"- Generated at: {datetime.now(timezone.utc).isoformat()}",
+        f"- Resolve project: `{payload.get('project_name', '')}`",
+        f"- Summary: {payload.get('summary', '')}",
+        "",
+        "## Project Settings",
+        "",
+        *_markdown_table(["Setting", "Observed"], [[key, value] for key, value in (payload.get("settings") or {}).items()]),
+        "",
+        "## Color Prep Timeline",
+        "",
+        *_markdown_table(
+            ["Field", "Value"],
+            [
+                ["exists", color_prep.get("exists", "")],
+                ["timeline", color_prep.get("timeline_name", "")],
+                ["layout", color_prep.get("layout", "")],
+                ["start_timecode", color_prep.get("start_timecode", "")],
+                ["start_frame", color_prep.get("start_frame", "")],
+                ["angles", ", ".join(color_prep.get("expected_angles") or [])],
+                ["video_tracks", ", ".join(color_prep.get("video_track_names") or [])],
+                ["audio_tracks", ", ".join(color_prep.get("audio_track_names") or [])],
+                ["markers", len(color_prep.get("markers") or {})],
+                ["take_count", color_prep.get("take_count", "")],
+            ],
+        ),
+        "",
+        "## Take Verification",
+        "",
+        *_markdown_table(
+            ["Take", "Marker Frame", "Audio Start", "Angles"],
+            _format_color_prep_take_rows(color_prep) or [["(none)", "", "", ""]],
+        ),
+        "",
+        "## Take Bins",
+        "",
+        *_markdown_table(
+            ["Take", "Bin", "Missing", "Extra"],
+            [
+                [
+                    take.get("take_id", ""),
+                    "yes" if take.get("bin_exists") else "no",
+                    ", ".join(take.get("missing_clips") or []),
+                    ", ".join(take.get("extra_clips") or []),
+                ]
+                for take in payload.get("take_bins") or []
+            ]
+            or [["(none)", "", "", ""]],
+        ),
+    ]
+    issue_rows = _issue_rows(payload)
+    if issue_rows:
+        lines.extend(["", "## Issues", "", *_markdown_table(["Severity", "Code", "Message"], issue_rows)])
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 def _triple(raw: str, field: str) -> tuple[float, float, float]:
@@ -149,19 +358,24 @@ def command_group_session(args: argparse.Namespace) -> int:
         return 0
 
     plan = plan_auto_group(session_root, incoming_dir=args.incoming_dir)
+    plan_json_path, plan_markdown_path = write_auto_group_plan_reports(session_root, plan)
     if args.dry_run:
         payload = auto_group_plan_to_dict(plan)
         payload["summary"] = f"planned {len(plan.takes)} takes from {plan.incoming_dir}"
+        payload["auto_group_plan_path"] = str(plan_markdown_path)
+        payload["auto_group_plan_json_path"] = str(plan_json_path)
         _emit(payload, as_json=args.json)
         return 0 if plan.status == "PASS" else 1
 
     if plan.status != "PASS":
         payload = auto_group_plan_to_dict(plan)
         payload["summary"] = "grouping plan is not PASS; refusing to apply"
+        payload["auto_group_plan_path"] = str(plan_markdown_path)
+        payload["auto_group_plan_json_path"] = str(plan_json_path)
         _emit(payload, as_json=args.json)
         return 1
 
-    apply_result = apply_auto_group(session_root, plan=plan, write_reports=False)
+    apply_result = apply_auto_group(session_root, plan=plan, write_reports=True)
     session = _prepare_session_config(
         session_root,
         project_name=args.project_name,
@@ -174,6 +388,8 @@ def command_group_session(args: argparse.Namespace) -> int:
         "session_config": str(session.session_path),
         "takes_created": apply_result.takes_created,
         "excluded_created": apply_result.excluded_created,
+        "auto_group_plan_path": str(plan_markdown_path),
+        "auto_group_apply_path": str(session_root / "reports" / "auto-group-apply.md"),
     }
     _emit(payload, as_json=args.json)
     return 0
@@ -191,6 +407,7 @@ def command_prepare_resolve_session(args: argparse.Namespace) -> int:
     if validation.status == "FAIL":
         payload = _validation_payload(validation)
         write_json_report(session.reports_path("prepare-resolve-session.json"), payload)
+        _write_prepare_markdown(session, payload)
         _emit(payload, as_json=args.json)
         return 1
 
@@ -239,9 +456,19 @@ def command_prepare_resolve_session(args: argparse.Namespace) -> int:
             restart_required = library_payload["status"] == "WARN" or storage_payload.get("restart_required", False)
             connection = ensure_resolve_running(restart=restart_required)
             connector = lambda: connection
-            bootstrap_payload = bootstrap_session(session, connector=connector, write_reports=False, fresh=args.fresh)
+            bootstrap_payload = bootstrap_session(
+                session,
+                connector=connector,
+                write_reports=False,
+                fresh=args.fresh,
+                rebuild_color_prep=args.rebuild_color_prep,
+            )
             final_payload["stages"]["bootstrap"] = bootstrap_payload
             final_payload["status"] = _fold_status(final_payload["status"], bootstrap_payload.get("status"))
+            if bootstrap_payload.get("status") != "FAIL":
+                post_reload_payload = verify_resolve_session_after_reload(session, connector=connector)
+                final_payload["stages"]["post_reload_verification"] = post_reload_payload
+                final_payload["status"] = _fold_status(final_payload["status"], post_reload_payload.get("status"))
         except (ResolveError, RuntimeError, subprocess.CalledProcessError) as exc:
             failure_payload: dict[str, Any] = {
                 "status": "FAIL",
@@ -287,10 +514,12 @@ def command_prepare_resolve_session(args: argparse.Namespace) -> int:
         final_payload["stages"]["operator_handoff"] = handoff_payload
         final_payload["operator_handoff_path"] = handoff_payload["handoff_path"]
         final_payload["summary"] = (
-            f"Resolve prepared for {session.resolve.project_name}; next create take multicams and grade with Local Grades"
+            f"Resolve prepared for {session.resolve.project_name}; next grade "
+            f"{session.resolve.color_prep_timeline_name} with Local Grades"
             + warning_suffix
         )
     write_json_report(session.reports_path("prepare-resolve-session.json"), final_payload)
+    _write_prepare_markdown(session, final_payload)
     _emit(final_payload, as_json=args.json)
     return 1 if final_payload["status"] == "FAIL" else 0
 
@@ -302,6 +531,7 @@ def command_inspect_resolve_session(args: argparse.Namespace) -> int:
     connection = ensure_resolve_running()
     connector = lambda: connection
     payload = inspect_resolve_session(session, connector=connector, write_reports=True)
+    _write_inspect_markdown(session, payload)
     _emit(payload, as_json=args.json)
     return 1 if payload["status"] == "FAIL" else 0
 
@@ -463,7 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     prepare_parser = subparsers.add_parser(
         "prepare-resolve-session",
-        help="prepare Resolve project, import media, and waveform-sync take clips",
+        help="prepare Resolve project, sync media, and build the color prep timeline",
     )
     prepare_parser.add_argument("session_root")
     prepare_parser.add_argument("--project-name")
@@ -472,12 +702,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--dry-run", action="store_true")
     prepare_parser.add_argument("--skip-edit-audio", action="store_true")
     prepare_parser.add_argument("--fresh", action="store_true")
+    prepare_parser.add_argument(
+        "--rebuild-color-prep",
+        action="store_true",
+        help="delete and recreate the color prep timeline; preserves it by default",
+    )
     prepare_parser.add_argument("--json", action="store_true")
     prepare_parser.set_defaults(func=command_prepare_resolve_session)
 
     inspect_resolve_parser = subparsers.add_parser(
         "inspect-resolve-session",
-        help="inspect Resolve project, bins, imported take clips, and project snapshot",
+        help="inspect Resolve project, bins, take clips, color prep timeline, and snapshot",
     )
     inspect_resolve_parser.add_argument("session_root")
     inspect_resolve_parser.add_argument("--json", action="store_true")

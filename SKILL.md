@@ -13,16 +13,16 @@ Default behavior stops at a Resolve-ready handoff:
 
 1. **group-session**: `<session-root>/incoming/` media -> `takes/take-XX/`.
 2. **prepare-resolve-session**: Resolve project, imports, audio proxies,
-   waveform-synced take timelines, storage paths, and HLG -> SDR Rec.709
-   color management.
+   waveform sync, `00_color_prep_all_takes`, storage paths, and HLG -> SDR
+   Rec.709 color management.
 3. **inspect-resolve-session**: verify the Resolve project, take bins, clips,
    color settings, and project snapshot.
 4. **operator-handoff**: write `reports/operator-handoff.md` for the human
    Resolve workflow.
 
 Do not run AI CDL / `manual-cdl` / `auto-state-99-v1` as part of the normal
-workflow. Color is handled manually in Resolve with multicam `Open in Timeline`,
-Local Grades, and Gallery Stills.
+workflow. Color is handled manually in Resolve on `00_color_prep_all_takes`
+with Local Grades and Gallery Stills before manual multicam conversion.
 
 ## Prerequisites
 
@@ -46,6 +46,9 @@ ${CLAUDE_SKILL_DIR}/scripts/pg group-session "<session-root>" --json
 
 - If `incoming/` is empty, Stage A returns PASS for an already-grouped session.
 - Verify `status == "PASS"` before continuing.
+- Read `<session-root>/reports/auto-group-plan.md` and verify angle labeling:
+  expected angle count, per-take labels, source filenames, lane IDs, and scores.
+  Labeling is part of E2E acceptance, not just a grouping implementation detail.
 - Use only `<session-root>/incoming/` by default. Do not look for
   `<session-root>/incomings/` unless the operator explicitly passes
   `--incoming-dir`.
@@ -58,11 +61,19 @@ ${CLAUDE_SKILL_DIR}/scripts/pg inspect-resolve-session "<session-root>" --json
 ${CLAUDE_SKILL_DIR}/scripts/pg operator-handoff "<session-root>" --json
 ```
 
-- Read `<session-root>/reports/prepare-resolve-session.json`.
-- Read `<session-root>/reports/inspect-resolve-session.json`.
+- Read `<session-root>/reports/prepare-resolve-session.md` first.
+- Read `<session-root>/reports/inspect-resolve-session.md` second.
 - Read `<session-root>/reports/operator-handoff.md`.
 - Continue on PASS or WARN. Halt on FAIL.
 - `prepare-resolve-session` also writes `operator-handoff.md` on success.
+- `prepare-resolve-session` must include a `post_reload_verification` stage:
+  it saves, closes, reloads, and re-inspects the Resolve project before the
+  run is considered complete.
+- JSON reports are still written for automation, but Markdown reports are the
+  human-facing source of truth.
+- Existing `00_color_prep_all_takes` timelines are preserved by default to
+  protect manual grades. Use `--rebuild-color-prep` only when the operator
+  explicitly wants to delete and recreate that timeline.
 
 Expected Resolve color settings:
 
@@ -98,18 +109,19 @@ manual Resolve color work.
 
 After Stage B, the operator works in Resolve:
 
-1. For each take, select its angle videos plus the final external audio.
-2. Create a multicam clip using `Sound` sync.
-3. Right-click the multicam clip -> `Open in Timeline`.
-4. Confirm sync, then disable or delete camera scratch audio and keep only the
-   external AIF/WAV audio for final use.
-5. On the Color page, use **Local Grades** inside the multicam timeline.
-6. Match angles within the same take first: white keys, black piano finish,
+1. Open `00_color_prep_all_takes`.
+2. Confirm the expected project color management is still active.
+3. Treat `compact-v1`, `compact-v2`, ... as packed rows; grade by the clip item
+   label (`angle-a`, `angle-b`, ...) rather than by track name.
+4. On the Color page, use **Local Grades** on the source angle timeline items.
+5. Match angles within the same take first: white keys, black piano finish,
    gold plate, skin when visible, and window highlights.
-7. Grab Gallery Stills for each angle and apply them as starting points for
+6. Grab Gallery Stills for each angle and apply them as starting points for
    the next take, then adjust exposure/WB for that take.
-8. Assemble graded multicam clips into the piece timeline and perform angle
-   switching.
+7. Do not use Remote Grades, Shared Nodes, or CDL commands for the standard
+   workflow.
+8. Duplicate the color-prep timeline before manual multicam conversion or
+   downstream editing.
 9. Use final timeline grades only for light take-to-take finishing.
 
 ## Hand-Off Message
@@ -120,8 +132,8 @@ Session bootstrap complete (Stages A/B).
   Resolve project: <project_name>
   Handoff: <session-root>/reports/operator-handoff.md
 
-Next step: open Resolve, create one multicam clip per take, open each
-multicam in timeline, and color-match angles with Local Grades.
+Next step: open Resolve, open `00_color_prep_all_takes`, and color-match source
+angle clips with Local Grades before manual multicam conversion.
 ```
 
 ## Experimental CDL Tools

@@ -10,7 +10,11 @@ import sys
 import time
 from typing import Any
 
+import numpy as np
+from scipy.signal import correlate, correlation_lags
+
 from piano_guard.config import SessionProjectConfig, TakeConfig, TimelineConfig, iter_session_takes
+from piano_guard.fftools import run_checked_bytes
 from piano_guard.review import MANUAL_CDL_VERSION_NAME
 from piano_guard.reports import Issue, issues_to_dict, write_json_report, write_markdown_report
 
@@ -1477,12 +1481,597 @@ def _build_session_assembly_timeline(
     return timeline, appended_payload
 
 
+COLOR_PREP_MARKER_PREFIX = "piano_guard:color_prep:"
+VIDEO_ONLY_MEDIA_TYPE = 1
+AUDIO_ONLY_MEDIA_TYPE = 2
+COLOR_PREP_SYNC_SAMPLE_RATE = 11_025
+COLOR_PREP_SYNC_HZ = 20.0
+COLOR_PREP_START_TIMECODE = "00:00:00;00"
+COLOR_PREP_LAYOUT = "compact"
+COLOR_PREP_SYNC_CONFIDENCE_WARN = 0.70
+
+
+def _timeline_frame_rate_value(timeline: TimelineConfig) -> float:
+    value = str(timeline.frame_rate)
+    if "/" in value:
+        numerator, denominator = value.split("/", 1)
+        return float(numerator) / float(denominator)
+    return float(value)
+
+
+def _decode_color_prep_sync_audio(path: Path) -> np.ndarray:
+    result = run_checked_bytes(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(COLOR_PREP_SYNC_SAMPLE_RATE),
+            "-f",
+            "s16le",
+            "-",
+        ]
+    )
+    samples = np.frombuffer(result.stdout, dtype="<i2")
+    if samples.size == 0:
+        raise ResolveError(f"decoded empty sync audio stream: {path}")
+    return samples.astype(np.float32) / 32768.0
+
+
+def _color_prep_sync_envelope(path: Path) -> np.ndarray:
+    samples = _decode_color_prep_sync_audio(path)
+    window_size = max(256, int(COLOR_PREP_SYNC_SAMPLE_RATE / COLOR_PREP_SYNC_HZ))
+    usable = samples[: samples.size - (samples.size % window_size)]
+    if usable.size == 0:
+        usable = samples
+    reshaped = usable.reshape(-1, window_size) if usable.size >= window_size else usable.reshape(1, -1)
+    envelope = np.sqrt(np.mean(np.square(reshaped), axis=1)).astype(np.float32)
+    envelope = np.log1p(envelope * 20.0)
+    centered = envelope - float(np.mean(envelope))
+    scale = float(np.std(centered))
+    if scale < 1e-6:
+        return np.zeros_like(centered, dtype=np.float32)
+    return centered / scale
+
+
+def _estimate_color_prep_sync_offset(
+    master_audio_path: Path,
+    video_path: Path,
+    *,
+    frame_rate: float,
+) -> dict[str, Any]:
+    """Return the video record-frame offset relative to the master audio.
+
+    Positive offsets mean the video starts later than master audio and should
+    be placed later on the color-prep timeline. Negative offsets mean the video
+    starts before master audio.
+    """
+    master = _color_prep_sync_envelope(master_audio_path)
+    scratch = _color_prep_sync_envelope(video_path)
+    if master.size == 0 or scratch.size == 0:
+        raise ResolveError(f"unable to build sync envelope for {video_path}")
+
+    corr = correlate(master, scratch, mode="full", method="fft")
+    lags = correlation_lags(master.size, scratch.size, mode="full")
+    index = int(np.argmax(corr))
+    lag_windows = int(lags[index])
+    denominator = float(np.linalg.norm(master) * np.linalg.norm(scratch))
+    confidence = float(corr[index] / denominator) if denominator > 1e-6 else 0.0
+    offset_seconds = lag_windows / COLOR_PREP_SYNC_HZ
+    offset_frames = int(round(offset_seconds * frame_rate))
+    return {
+        "offset_frames": offset_frames,
+        "offset_seconds": offset_seconds,
+        "confidence": confidence,
+    }
+
+
+def _color_prep_angles(session: SessionProjectConfig) -> list[str]:
+    angles: list[str] = []
+    seen: set[str] = set()
+    for angle in session.angles:
+        if angle not in seen:
+            angles.append(angle)
+            seen.add(angle)
+    for _take_ref, take in iter_session_takes(session):
+        for camera in take.camera_files:
+            if camera.label not in seen:
+                angles.append(camera.label)
+                seen.add(camera.label)
+    return angles
+
+
+def _ordered_take_cameras(take: TakeConfig, angle_order: dict[str, int]) -> list[Any]:
+    return sorted(
+        take.camera_files,
+        key=lambda camera: (
+            angle_order.get(camera.label, len(angle_order)),
+            camera.label,
+            camera.file,
+        ),
+    )
+
+
+def _ensure_track_count(timeline: Any, track_type: str, count: int) -> None:
+    while int(timeline.GetTrackCount(track_type) or 0) < count:
+        if track_type == "audio":
+            try:
+                added = timeline.AddTrack("audio", "stereo")
+            except TypeError:
+                added = timeline.AddTrack("audio")
+        else:
+            added = timeline.AddTrack(track_type)
+        if not added:
+            raise ResolveError(f"unable to add {track_type} track for color prep timeline")
+
+
+def _set_track_name_if_possible(timeline: Any, track_type: str, index: int, name: str) -> None:
+    if hasattr(timeline, "SetTrackName") and not timeline.SetTrackName(track_type, index, name):
+        raise ResolveError(f"unable to set {track_type} track {index} name to {name!r}")
+
+
+def _color_prep_timeline_items(timeline: Any, track_type: str, track_index: int) -> list[Any]:
+    if not hasattr(timeline, "GetItemListInTrack"):
+        return []
+    return list(timeline.GetItemListInTrack(track_type, track_index) or [])
+
+
+def _timeline_item_clip_name(item: Any) -> str:
+    if hasattr(item, "GetName"):
+        return str(item.GetName())
+    return ""
+
+
+def _timeline_item_start(item: Any) -> int | None:
+    if not hasattr(item, "GetStart"):
+        return None
+    try:
+        return int(round(float(item.GetStart(False))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _append_color_prep_clip(
+    media_pool: Any,
+    *,
+    clip: Any,
+    media_type: int,
+    track_index: int,
+    record_frame: int,
+    frame_count: int,
+) -> None:
+    appended = media_pool.AppendToTimeline(
+        [
+            {
+                "mediaPoolItem": clip,
+                "startFrame": 0,
+                "endFrame": frame_count,
+                "mediaType": media_type,
+                "trackIndex": track_index,
+                "recordFrame": record_frame,
+            }
+        ]
+    )
+    if not appended:
+        raise ResolveError(f"unable to append {clip.GetName()} to color prep timeline")
+
+
+def _build_color_prep_timeline(
+    *,
+    project: Any,
+    media_pool: Any,
+    takes_root: Any,
+    timelines_folder: Any,
+    session: SessionProjectConfig,
+    rebuild: bool = False,
+) -> dict[str, Any]:
+    timeline_name = session.resolve.color_prep_timeline_name
+    existing = _timeline_by_name(project, timeline_name)
+    if existing is not None and not rebuild:
+        issue = Issue(
+            severity="warn",
+            code="color_prep_existing_preserved",
+            message=f"color prep timeline {timeline_name!r} already exists; preserving manual grades",
+            context={"timeline": timeline_name, "rebuild_flag": "--rebuild-color-prep"},
+        )
+        return {
+            "status": "WARN",
+            "action": "preserved-existing",
+            "timeline_name": timeline_name,
+            "issues": issues_to_dict([issue]),
+            "summary": f"preserved existing color prep timeline {timeline_name}",
+        }
+    if existing is not None:
+        _delete_timeline_if_exists(project, media_pool, timeline_name)
+
+    angles = _color_prep_angles(session)
+    if not angles:
+        raise ResolveError("cannot build color prep timeline without angle labels")
+
+    media_pool.SetCurrentFolder(timelines_folder)
+    timeline = media_pool.CreateEmptyTimeline(timeline_name)
+    if not timeline:
+        raise ResolveError(f"unable to create color prep timeline {timeline_name}")
+    if hasattr(timeline, "SetStartTimecode") and not timeline.SetStartTimecode(COLOR_PREP_START_TIMECODE):
+        raise ResolveError(f"unable to set {timeline_name} start timecode to {COLOR_PREP_START_TIMECODE}")
+    if not project.SetCurrentTimeline(timeline):
+        raise ResolveError(f"unable to set {timeline_name} as current timeline")
+
+    max_video_tracks = max((len(take.camera_files) for _take_ref, take in iter_session_takes(session)), default=0)
+    if max_video_tracks <= 0:
+        raise ResolveError("cannot build color prep timeline without camera files")
+
+    _ensure_track_count(timeline, "video", max_video_tracks)
+    _ensure_track_count(timeline, "audio", 1)
+    for index in range(1, max_video_tracks + 1):
+        _set_track_name_if_possible(timeline, "video", index, f"compact-v{index}")
+    _set_track_name_if_possible(timeline, "audio", 1, "master-audio")
+
+    frame_rate = _timeline_frame_rate_value(session.timeline)
+    gap_frames = int(round(frame_rate * float(session.resolve.color_prep_gap_seconds)))
+    record_frame = 0
+    take_payloads: list[dict[str, Any]] = []
+    issues: list[Issue] = []
+    angle_order = {angle: index for index, angle in enumerate(angles)}
+    video_track_map = {f"compact-v{index}": index for index in range(1, max_video_tracks + 1)}
+
+    for take_ref, take in iter_session_takes(session):
+        folder = _folder_by_name(takes_root, take_ref.id)
+        ordered_cameras = _ordered_take_cameras(take, angle_order)
+        appended_angles: list[dict[str, Any]] = []
+        missing_angles = [angle for angle in angles if angle not in {camera.label for camera in take.camera_files}]
+        take_frame_counts: list[int] = []
+        sync_by_angle: dict[str, dict[str, Any]] = {}
+        for camera in take.camera_files:
+            sync_by_angle[camera.label] = _estimate_color_prep_sync_offset(
+                take.editing_audio_path(),
+                take.resolve_path(camera.file),
+                frame_rate=frame_rate,
+            )
+        timeline_zero_shift = max(
+            0,
+            -min((sync["offset_frames"] for sync in sync_by_angle.values()), default=0),
+        )
+        audio_record_frame = record_frame + timeline_zero_shift
+
+        for track_index, camera in enumerate(ordered_cameras, start=1):
+            angle = camera.label
+            clip = _clips_for_paths(folder, [take.resolve_path(camera.file)])[0]
+            frame_count = _clip_frame_count(clip, frame_rate=frame_rate)
+            sync = sync_by_angle[angle]
+            sync_confidence = float(sync["confidence"])
+            clip_record_frame = audio_record_frame + int(sync["offset_frames"])
+            _append_color_prep_clip(
+                media_pool,
+                clip=clip,
+                media_type=VIDEO_ONLY_MEDIA_TYPE,
+                track_index=track_index,
+                record_frame=clip_record_frame,
+                frame_count=frame_count,
+            )
+            take_frame_counts.append((clip_record_frame - record_frame) + frame_count)
+            if sync_confidence < COLOR_PREP_SYNC_CONFIDENCE_WARN:
+                issues.append(
+                    Issue(
+                        severity="warn",
+                        code="color_prep_sync_confidence_low",
+                        message=(
+                            f"{take_ref.id}/{angle}: audio sync confidence "
+                            f"{sync_confidence:.3f} is below {COLOR_PREP_SYNC_CONFIDENCE_WARN:.2f}"
+                        ),
+                        context={
+                            "take_id": take_ref.id,
+                            "angle": angle,
+                            "track_index": track_index,
+                            "sync_confidence": round(sync_confidence, 4),
+                            "threshold": COLOR_PREP_SYNC_CONFIDENCE_WARN,
+                        },
+                    )
+                )
+            appended_angles.append(
+                {
+                    "angle": angle,
+                    "clip_name": clip.GetName(),
+                    "track_index": track_index,
+                    "frame_count": frame_count,
+                    "record_frame": clip_record_frame,
+                    "sync_offset_frames": int(sync["offset_frames"]),
+                    "sync_offset_seconds": round(float(sync["offset_seconds"]), 4),
+                    "sync_confidence": round(sync_confidence, 4),
+                }
+            )
+
+        audio_clip = _clips_for_paths(folder, [take.editing_audio_path()])[0]
+        audio_frame_count = _clip_frame_count(audio_clip, frame_rate=frame_rate)
+        _append_color_prep_clip(
+            media_pool,
+            clip=audio_clip,
+            media_type=AUDIO_ONLY_MEDIA_TYPE,
+            track_index=1,
+            record_frame=audio_record_frame,
+            frame_count=audio_frame_count,
+        )
+        take_frame_counts.append((audio_record_frame - record_frame) + audio_frame_count)
+
+        marker_custom_data = f"{COLOR_PREP_MARKER_PREFIX}{take_ref.id}"
+        if not timeline.AddMarker(audio_record_frame, "Blue", take_ref.id, "", 1, marker_custom_data):
+            raise ResolveError(f"unable to add color prep marker for {take_ref.id}")
+        segment_frames = max(take_frame_counts)
+        take_payloads.append(
+            {
+                "take_id": take_ref.id,
+                "record_frame": record_frame,
+                "marker_frame": audio_record_frame,
+                "segment_frames": segment_frames,
+                "gap_frames_after": gap_frames,
+                "timeline_zero_shift_frames": timeline_zero_shift,
+                "angles": appended_angles,
+                "missing_angles": missing_angles,
+                "audio": {
+                    "clip_name": audio_clip.GetName(),
+                    "track_index": 1,
+                    "frame_count": audio_frame_count,
+                    "record_frame": audio_record_frame,
+                },
+                "marker_custom_data": marker_custom_data,
+            }
+        )
+        record_frame += segment_frames + gap_frames
+
+    return {
+        "status": "PASS",
+        "action": "rebuilt" if rebuild else "created",
+        "timeline_name": timeline_name,
+        "start_timecode": COLOR_PREP_START_TIMECODE,
+        "layout": COLOR_PREP_LAYOUT,
+        "angles": angles,
+        "video_track_map": video_track_map,
+        "max_video_tracks": max_video_tracks,
+        "audio_track": "master-audio",
+        "gap_seconds": float(session.resolve.color_prep_gap_seconds),
+        "gap_frames": gap_frames,
+        "take_count": len(take_payloads),
+        "takes": take_payloads,
+        "issues": issues_to_dict(issues),
+        "summary": f"created color prep timeline {timeline_name} for {len(take_payloads)} take(s)",
+    }
+
+
+def _inspect_color_prep_timeline(project: Any, session: SessionProjectConfig) -> tuple[dict[str, Any], list[Issue]]:
+    timeline_name = session.resolve.color_prep_timeline_name
+    angles = _color_prep_angles(session)
+    payload: dict[str, Any] = {
+        "timeline_name": timeline_name,
+        "exists": False,
+        "start_timecode": None,
+        "start_frame": None,
+        "layout": COLOR_PREP_LAYOUT,
+        "expected_angles": angles,
+        "expected_video_track_count": max((len(take.camera_files) for _take_ref, take in iter_session_takes(session)), default=0),
+        "video_track_count": 0,
+        "audio_track_count": 0,
+        "video_track_names": [],
+        "audio_track_names": [],
+        "take_count": len(session.takes),
+        "markers": {},
+        "takes": [],
+    }
+    issues: list[Issue] = []
+    timeline = _timeline_by_name(project, timeline_name)
+    if timeline is None:
+        issues.append(
+            Issue(
+                severity="fail",
+                code="color_prep_timeline_missing",
+                message=f"color prep timeline {timeline_name!r} is missing",
+                context={"timeline": timeline_name},
+            )
+        )
+        return payload, issues
+
+    payload["exists"] = True
+    if hasattr(timeline, "GetStartTimecode"):
+        payload["start_timecode"] = timeline.GetStartTimecode()
+        if payload["start_timecode"] != COLOR_PREP_START_TIMECODE:
+            issues.append(
+                Issue(
+                    severity="fail",
+                    code="color_prep_start_timecode_mismatch",
+                    message=(
+                        f"color prep timeline starts at {payload['start_timecode']!r}, "
+                        f"expected {COLOR_PREP_START_TIMECODE!r}; early recordFrame items may not persist"
+                    ),
+                    context={"expected": COLOR_PREP_START_TIMECODE, "observed": payload["start_timecode"]},
+                )
+            )
+    if hasattr(timeline, "GetStartFrame"):
+        try:
+            payload["start_frame"] = int(timeline.GetStartFrame())
+        except (TypeError, ValueError):
+            payload["start_frame"] = None
+    video_count = int(timeline.GetTrackCount("video") or 0)
+    audio_count = int(timeline.GetTrackCount("audio") or 0)
+    payload["video_track_count"] = video_count
+    payload["audio_track_count"] = audio_count
+    payload["video_track_names"] = [
+        str(timeline.GetTrackName("video", index)) if hasattr(timeline, "GetTrackName") else ""
+        for index in range(1, video_count + 1)
+    ]
+    payload["audio_track_names"] = [
+        str(timeline.GetTrackName("audio", index)) if hasattr(timeline, "GetTrackName") else ""
+        for index in range(1, audio_count + 1)
+    ]
+    expected_video_track_count = int(payload["expected_video_track_count"])
+    if video_count < expected_video_track_count:
+        issues.append(
+            Issue(
+                severity="fail",
+                code="color_prep_video_tracks_missing",
+                message=f"color prep timeline has {video_count} video tracks, expected at least {expected_video_track_count}",
+                context={"expected": expected_video_track_count, "observed": video_count},
+            )
+        )
+    if audio_count < 1:
+        issues.append(
+            Issue(
+                severity="fail",
+                code="color_prep_audio_track_missing",
+                message="color prep timeline has no audio track",
+            )
+        )
+
+    for index in range(1, expected_video_track_count + 1):
+        expected_name = f"compact-v{index}"
+        observed = payload["video_track_names"][index - 1] if index <= len(payload["video_track_names"]) else ""
+        if observed and observed != expected_name:
+            issues.append(
+                Issue(
+                    severity="warn",
+                    code="color_prep_track_name_mismatch",
+                    message=f"video track {index} is named {observed!r}, expected {expected_name!r}",
+                    context={"track_type": "video", "track_index": index, "expected": expected_name, "observed": observed},
+                )
+            )
+    if payload["audio_track_names"] and payload["audio_track_names"][0] not in {"", "master-audio"}:
+        issues.append(
+            Issue(
+                severity="warn",
+                code="color_prep_track_name_mismatch",
+                message=f"audio track 1 is named {payload['audio_track_names'][0]!r}, expected 'master-audio'",
+                context={
+                    "track_type": "audio",
+                    "track_index": 1,
+                    "expected": "master-audio",
+                    "observed": payload["audio_track_names"][0],
+                },
+            )
+        )
+
+    markers = timeline.GetMarkers() or {}
+    payload["markers"] = markers
+    marker_frames_by_custom_data = {
+        str(marker.get("customData") or ""): int(round(float(frame)))
+        for frame, marker in markers.items()
+        if isinstance(marker, dict)
+    }
+    video_items_by_track: dict[int, list[Any]] = {}
+    for track_index in range(1, expected_video_track_count + 1):
+        video_items_by_track[track_index] = sorted(
+            _color_prep_timeline_items(timeline, "video", track_index),
+            key=lambda item: _timeline_item_start(item) if _timeline_item_start(item) is not None else -1,
+        )
+    audio_items = sorted(
+        [
+            item
+            for item in _color_prep_timeline_items(timeline, "audio", 1)
+            if _timeline_item_clip_name(item) == "audio-master"
+        ],
+        key=lambda item: _timeline_item_start(item) if _timeline_item_start(item) is not None else -1,
+    )
+
+    angle_order = {angle: index for index, angle in enumerate(angles)}
+    for take_ref, take in iter_session_takes(session):
+        marker_custom_data = f"{COLOR_PREP_MARKER_PREFIX}{take_ref.id}"
+        marker_frame = marker_frames_by_custom_data.get(marker_custom_data)
+        ordered_cameras = _ordered_take_cameras(take, angle_order)
+
+        take_payload = {
+            "take_id": take_ref.id,
+            "marker_frame": marker_frame,
+            "marker_exists": marker_frame is not None,
+            "angles": [],
+            "audio_exists": False,
+            "audio_start": None,
+        }
+        if not take_payload["marker_exists"]:
+            issues.append(
+                Issue(
+                    severity="fail",
+                    code="color_prep_take_marker_missing",
+                    message=f"{take_ref.id}: color prep take marker is missing",
+                    context={"take_id": take_ref.id},
+                )
+            )
+
+        for track_index in range(1, expected_video_track_count + 1):
+            expected = ordered_cameras[track_index - 1] if track_index <= len(ordered_cameras) else None
+            if expected is None:
+                take_payload["angles"].append({"track_index": track_index, "expected": False, "exists": False})
+                continue
+            angle = expected.label
+            item = video_items_by_track.get(track_index, []).pop(0) if video_items_by_track.get(track_index) else None
+            item_start = _timeline_item_start(item) if item is not None else None
+            observed_name = _timeline_item_clip_name(item) if item is not None else None
+            exists = item is not None and observed_name == angle
+            take_payload["angles"].append(
+                {
+                    "angle": angle,
+                    "expected": True,
+                    "exists": exists,
+                    "track_index": track_index,
+                    "start_frame": item_start,
+                    "observed_name": observed_name,
+                }
+            )
+            if not exists:
+                issues.append(
+                    Issue(
+                        severity="fail",
+                        code="color_prep_angle_item_missing",
+                        message=f"{take_ref.id}/{angle}: color prep timeline item is missing",
+                        context={
+                            "take_id": take_ref.id,
+                            "angle": angle,
+                            "track_index": track_index,
+                            "observed_name": observed_name,
+                        },
+                    )
+                )
+
+        audio_item = audio_items.pop(0) if audio_items else None
+        take_payload["audio_exists"] = audio_item is not None
+        take_payload["audio_start"] = _timeline_item_start(audio_item) if audio_item is not None else None
+        if take_payload["audio_exists"] and marker_frame is not None and take_payload["audio_start"] != marker_frame:
+            issues.append(
+                Issue(
+                    severity="fail",
+                    code="color_prep_audio_marker_mismatch",
+                    message=f"{take_ref.id}: audio item starts at {take_payload['audio_start']}, marker is at {marker_frame}",
+                    context={
+                        "take_id": take_ref.id,
+                        "audio_start": take_payload["audio_start"],
+                        "marker_frame": marker_frame,
+                    },
+                )
+            )
+        if not take_payload["audio_exists"]:
+            issues.append(
+                Issue(
+                    severity="fail",
+                    code="color_prep_audio_item_missing",
+                    message=f"{take_ref.id}: color prep audio item is missing",
+                    context={"take_id": take_ref.id, "track_index": 1},
+                )
+            )
+        payload["takes"].append(take_payload)
+
+    return payload, issues
+
+
 def bootstrap_session(
     session: SessionProjectConfig,
     *,
     connector=connect_to_resolve,
     write_reports: bool = True,
     fresh: bool = False,
+    rebuild_color_prep: bool = False,
 ) -> dict[str, Any]:
     connection = connector()
     current_database = _select_project_library(connection, session)
@@ -1517,6 +2106,15 @@ def bootstrap_session(
                 "editing_audio": str(take.editing_audio_path()),
             }
         )
+
+    color_prep_payload = _build_color_prep_timeline(
+        project=project,
+        media_pool=media_pool,
+        takes_root=folders["takes"],
+        timelines_folder=folders["timelines"],
+        session=session,
+        rebuild=rebuild_color_prep,
+    )
 
     connection.project_manager.SaveProject()
     snapshot_error: str | None = None
@@ -1622,6 +2220,8 @@ def bootstrap_session(
                 context={"timeline": timeline_name},
             )
         )
+    for issue in color_prep_payload.get("issues", []) or []:
+        issues.append(Issue(**issue))
 
     status = "FAIL" if any(issue.severity == "fail" for issue in issues) else ("WARN" if issues else "PASS")
     summary = (
@@ -1638,6 +2238,7 @@ def bootstrap_session(
         "project_action": "created" if created else "loaded",
         "settings": settings,
         "takes": take_payloads,
+        "color_prep": color_prep_payload,
         "current_timeline": current_timeline.GetName() if current_timeline else None,
         "top_level_bins": [session.resolve.takes_bin, session.resolve.timelines_bin],
         "stale_top_level_bins": stale_top_level_bins,
@@ -1699,6 +2300,7 @@ def inspect_resolve_session(
         "stale_top_level_bins": [],
         "take_bins": [],
         "timeline_names": [],
+        "color_prep_timeline": {},
         "current_timeline": None,
     }
 
@@ -1848,6 +2450,9 @@ def inspect_resolve_session(
         payload["timeline_names"] = sorted(timeline_names)
         current_timeline = project.GetCurrentTimeline()
         payload["current_timeline"] = current_timeline.GetName() if current_timeline else None
+        color_prep_payload, color_prep_issues = _inspect_color_prep_timeline(project, session)
+        payload["color_prep_timeline"] = color_prep_payload
+        issues.extend(color_prep_issues)
 
     if not payload["project_snapshot_exists"]:
         issues.append(
@@ -1869,6 +2474,70 @@ def inspect_resolve_session(
     )
     if write_reports:
         write_json_report(session.reports_path("inspect-resolve-session.json"), payload)
+    return payload
+
+
+def verify_resolve_session_after_reload(
+    session: SessionProjectConfig,
+    *,
+    connector=connect_to_resolve,
+) -> dict[str, Any]:
+    connection = connector()
+    current_project = connection.project_manager.GetCurrentProject()
+    closed_project = False
+    if current_project is not None:
+        connection.project_manager.SaveProject()
+        if current_project.GetName() == session.resolve.project_name:
+            closed_project = bool(connection.project_manager.CloseProject(current_project))
+            if not closed_project:
+                return {
+                    "status": "FAIL",
+                    "summary": f"unable to close Resolve project {session.resolve.project_name} for reload verification",
+                    "closed_project": False,
+                    "reloaded_project": False,
+                    "issues": [
+                        {
+                            "severity": "fail",
+                            "code": "post_reload_close_failed",
+                            "message": f"unable to close Resolve project {session.resolve.project_name}",
+                            "context": {"project_name": session.resolve.project_name},
+                        }
+                    ],
+                }
+
+    reloaded = connection.project_manager.LoadProject(session.resolve.project_name)
+    if not reloaded:
+        return {
+            "status": "FAIL",
+            "summary": f"unable to reload Resolve project {session.resolve.project_name}",
+            "closed_project": closed_project,
+            "reloaded_project": False,
+            "issues": [
+                {
+                    "severity": "fail",
+                    "code": "post_reload_load_failed",
+                    "message": f"unable to reload Resolve project {session.resolve.project_name}",
+                    "context": {"project_name": session.resolve.project_name},
+                }
+            ],
+        }
+
+    inspection = inspect_resolve_session(session, connector=lambda: connection, write_reports=False)
+    color_prep = inspection.get("color_prep_timeline") or {}
+    payload = {
+        "status": inspection.get("status", "FAIL"),
+        "summary": (
+            f"post-reload verification passed for {session.resolve.project_name}"
+            if inspection.get("status") == "PASS"
+            else f"post-reload verification found {len(inspection.get('issues') or [])} issue(s)"
+        ),
+        "closed_project": closed_project,
+        "reloaded_project": True,
+        "project_loaded_name": inspection.get("project_loaded_name"),
+        "color_prep_timeline": color_prep,
+        "issues": inspection.get("issues", []),
+    }
+    connection.project_manager.SaveProject()
     return payload
 
 

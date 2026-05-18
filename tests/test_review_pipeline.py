@@ -17,7 +17,7 @@ from piano_guard import autogroup
 from piano_guard import resolve_ops
 from piano_guard.handoff import write_operator_handoff
 from piano_guard.review import MANUAL_CDL_VERSION_NAME, build_review_manifest, write_contact_sheet
-from piano_guard.config import load_session
+from piano_guard.config import iter_session_takes, load_session
 from piano_guard.stills import preview_cdl_on_still
 
 
@@ -70,6 +70,175 @@ def _write_stills(root: Path, takes: dict[str, list[str]]) -> None:
             color = 40 + index * 40
             image = np.full((24, 36, 3), color, dtype=np.uint8)
             cv2.imwrite(str(still_dir / f"{angle}.png"), image)
+
+
+class FakeResolveClip:
+    def __init__(self, name: str, path: Path, frames: int = 100) -> None:
+        self._name = name
+        self._path = str(path.resolve())
+        self._frames = frames
+
+    def GetName(self) -> str:
+        return self._name
+
+    def GetClipProperty(self) -> dict[str, str]:
+        return {"File Path": self._path, "Frames": str(self._frames)}
+
+
+class FakeTimelineItem:
+    def __init__(self, name: str, start: int) -> None:
+        self._name = name
+        self._start = start
+
+    def GetName(self) -> str:
+        return self._name
+
+    def GetStart(self, _subframe_precision: bool = False) -> int:
+        return self._start
+
+
+class FakeResolveFolder:
+    def __init__(
+        self,
+        name: str,
+        *,
+        clips: list[FakeResolveClip] | None = None,
+        subfolders: list["FakeResolveFolder"] | None = None,
+    ) -> None:
+        self._name = name
+        self._clips = clips or []
+        self._subfolders = subfolders or []
+
+    def GetName(self) -> str:
+        return self._name
+
+    def GetClipList(self) -> list[FakeResolveClip]:
+        return list(self._clips)
+
+    def GetSubFolderList(self) -> list["FakeResolveFolder"]:
+        return list(self._subfolders)
+
+
+class FakeResolveTimeline:
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._track_counts = {"video": 1, "audio": 1}
+        self._track_names: dict[tuple[str, int], str] = {}
+        self._items: dict[tuple[str, int], list[FakeTimelineItem]] = {}
+        self._markers: dict[int, dict[str, str | int]] = {}
+        self._start_timecode = "01:00:00;00"
+
+    def GetName(self) -> str:
+        return self._name
+
+    def SetStartTimecode(self, timecode: str) -> bool:
+        self._start_timecode = timecode
+        return True
+
+    def GetStartTimecode(self) -> str:
+        return self._start_timecode
+
+    def GetStartFrame(self) -> int:
+        return 0 if self._start_timecode == resolve_ops.COLOR_PREP_START_TIMECODE else 107892
+
+    def GetTrackCount(self, track_type: str) -> int:
+        return self._track_counts.get(track_type, 0)
+
+    def AddTrack(self, track_type: str, *_args) -> bool:
+        self._track_counts[track_type] = self._track_counts.get(track_type, 0) + 1
+        return True
+
+    def SetTrackName(self, track_type: str, index: int, name: str) -> bool:
+        self._track_names[(track_type, index)] = name
+        return True
+
+    def GetTrackName(self, track_type: str, index: int) -> str:
+        return self._track_names.get((track_type, index), "")
+
+    def AddMarker(self, frame: int, color: str, name: str, note: str, duration: int, custom_data: str) -> bool:
+        self._markers[frame] = {
+            "color": color,
+            "name": name,
+            "note": note,
+            "duration": duration,
+            "customData": custom_data,
+        }
+        return True
+
+    def GetMarkers(self) -> dict[int, dict[str, str | int]]:
+        return dict(self._markers)
+
+    def add_item(self, track_type: str, track_index: int, item: FakeTimelineItem) -> None:
+        self._items.setdefault((track_type, track_index), []).append(item)
+
+    def GetItemListInTrack(self, track_type: str, index: int) -> list[FakeTimelineItem]:
+        return list(self._items.get((track_type, index), []))
+
+
+class FakeResolveProject:
+    def __init__(self) -> None:
+        self.timelines: list[FakeResolveTimeline] = []
+        self.current_timeline: FakeResolveTimeline | None = None
+
+    def SetCurrentTimeline(self, timeline: FakeResolveTimeline) -> bool:
+        self.current_timeline = timeline
+        return True
+
+    def GetTimelineCount(self) -> int:
+        return len(self.timelines)
+
+    def GetTimelineByIndex(self, index: int) -> FakeResolveTimeline | None:
+        return self.timelines[index - 1] if 1 <= index <= len(self.timelines) else None
+
+
+class FakeResolveMediaPool:
+    def __init__(self, project: FakeResolveProject) -> None:
+        self.project = project
+        self.current_folder: FakeResolveFolder | None = None
+        self.append_calls: list[dict[str, object]] = []
+
+    def SetCurrentFolder(self, folder: FakeResolveFolder) -> bool:
+        self.current_folder = folder
+        return True
+
+    def CreateEmptyTimeline(self, name: str) -> FakeResolveTimeline:
+        timeline = FakeResolveTimeline(name)
+        self.project.timelines.append(timeline)
+        return timeline
+
+    def DeleteTimelines(self, timelines: list[FakeResolveTimeline]) -> bool:
+        for timeline in timelines:
+            if timeline in self.project.timelines:
+                self.project.timelines.remove(timeline)
+        return True
+
+    def AppendToTimeline(self, clip_infos: list[dict[str, object]]) -> list[FakeTimelineItem]:
+        timeline = self.project.current_timeline
+        assert timeline is not None
+        items = []
+        for info in clip_infos:
+            self.append_calls.append(dict(info))
+            clip = info["mediaPoolItem"]
+            assert isinstance(clip, FakeResolveClip)
+            media_type = int(info["mediaType"])
+            track_type = "video" if media_type == resolve_ops.VIDEO_ONLY_MEDIA_TYPE else "audio"
+            track_index = int(info["trackIndex"])
+            item = FakeTimelineItem(clip.GetName(), int(info["recordFrame"]))
+            timeline.add_item(track_type, track_index, item)
+            items.append(item)
+        return items
+
+
+def _fake_takes_root(session) -> FakeResolveFolder:
+    take_folders = []
+    for take_ref, take in iter_session_takes(session):
+        clips = [
+            FakeResolveClip(camera.label, take.resolve_path(camera.file), frames=100 + index * 10)
+            for index, camera in enumerate(take.camera_files)
+        ]
+        clips.append(FakeResolveClip("audio-master", take.editing_audio_path(), frames=130))
+        take_folders.append(FakeResolveFolder(take_ref.id, clips=clips))
+    return FakeResolveFolder("Takes", subfolders=take_folders)
 
 
 class ReviewPipelineTests(unittest.TestCase):
@@ -239,6 +408,199 @@ class ReviewPipelineTests(unittest.TestCase):
         self.assertIn("contact-sheet", help_text)
         self.assertNotIn("manual-cdl", help_text)
         self.assertNotIn("preview-cdl", help_text)
+
+    def test_prepare_help_shows_rebuild_color_prep_flag(self) -> None:
+        stdout = io.StringIO()
+        with self.assertRaises(SystemExit) as raised:
+            with contextlib.redirect_stdout(stdout):
+                cli.build_parser().parse_args(["prepare-resolve-session", "--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("--rebuild-color-prep", stdout.getvalue())
+
+    def test_color_prep_timeline_uses_compact_tracks_and_record_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            takes = {
+                "take-01": ["angle-b", "angle-c"],
+                "take-02": ["angle-b", "angle-d"],
+            }
+            _write_session(root, reference_angle=None, takes=takes)
+            session = load_session(root / "session.yaml")
+            project = FakeResolveProject()
+            media_pool = FakeResolveMediaPool(project)
+            takes_root = _fake_takes_root(session)
+            timelines_folder = FakeResolveFolder("Timelines")
+
+            def fake_offset(_audio_path, video_path, *, frame_rate):
+                offsets = {"angle-b": 0, "angle-c": 10, "angle-d": -5}
+                return {
+                    "offset_frames": offsets[Path(video_path).stem],
+                    "offset_seconds": offsets[Path(video_path).stem] / frame_rate,
+                    "confidence": 0.9,
+                }
+
+            with mock.patch.object(resolve_ops, "_estimate_color_prep_sync_offset", side_effect=fake_offset):
+                payload = resolve_ops._build_color_prep_timeline(
+                    project=project,
+                    media_pool=media_pool,
+                    takes_root=takes_root,
+                    timelines_folder=timelines_folder,
+                    session=session,
+                    rebuild=False,
+                )
+
+            self.assertEqual(payload["status"], "PASS")
+            self.assertEqual(payload["start_timecode"], "00:00:00;00")
+            self.assertEqual(payload["layout"], "compact")
+            self.assertEqual(payload["angles"], ["angle-b", "angle-c", "angle-d"])
+            self.assertEqual(payload["video_track_map"], {"compact-v1": 1, "compact-v2": 2})
+            self.assertEqual(payload["max_video_tracks"], 2)
+            self.assertEqual(payload["gap_frames"], 150)
+            self.assertEqual([take["record_frame"] for take in payload["takes"]], [0, 280])
+            self.assertEqual([take["marker_frame"] for take in payload["takes"]], [0, 285])
+            self.assertEqual(payload["takes"][0]["audio"]["record_frame"], 0)
+            self.assertEqual(payload["takes"][1]["audio"]["record_frame"], 285)
+            self.assertEqual(payload["takes"][1]["timeline_zero_shift_frames"], 5)
+
+            calls = media_pool.append_calls
+            self.assertEqual(len(calls), 6)
+            self.assertEqual(
+                [(call["mediaType"], call["trackIndex"], call["recordFrame"]) for call in calls],
+                [
+                    (resolve_ops.VIDEO_ONLY_MEDIA_TYPE, 1, 0),
+                    (resolve_ops.VIDEO_ONLY_MEDIA_TYPE, 2, 10),
+                    (resolve_ops.AUDIO_ONLY_MEDIA_TYPE, 1, 0),
+                    (resolve_ops.VIDEO_ONLY_MEDIA_TYPE, 1, 285),
+                    (resolve_ops.VIDEO_ONLY_MEDIA_TYPE, 2, 280),
+                    (resolve_ops.AUDIO_ONLY_MEDIA_TYPE, 1, 285),
+                ],
+            )
+
+            timeline = project.timelines[0]
+            self.assertEqual(timeline.GetStartTimecode(), "00:00:00;00")
+            self.assertEqual(timeline.GetTrackName("video", 1), "compact-v1")
+            self.assertEqual(timeline.GetTrackName("video", 2), "compact-v2")
+            self.assertEqual(timeline.GetTrackName("audio", 1), "master-audio")
+            self.assertIn("piano_guard:color_prep:take-01", {marker["customData"] for marker in timeline.GetMarkers().values()})
+            self.assertEqual(
+                {marker["customData"]: frame for frame, marker in timeline.GetMarkers().items()},
+                {"piano_guard:color_prep:take-01": 0, "piano_guard:color_prep:take-02": 285},
+            )
+
+            inspected, issues = resolve_ops._inspect_color_prep_timeline(project, session)
+            self.assertEqual(inspected["start_timecode"], "00:00:00;00")
+            self.assertEqual(inspected["start_frame"], 0)
+            self.assertEqual(inspected["layout"], "compact")
+            self.assertEqual(inspected["expected_video_track_count"], 2)
+            self.assertEqual([take["marker_frame"] for take in inspected["takes"]], [0, 285])
+            self.assertEqual(inspected["takes"][1]["audio_start"], 285)
+            self.assertEqual(
+                [
+                    angle["start_frame"]
+                    for angle in inspected["takes"][1]["angles"]
+                    if angle["angle"] == "angle-d"
+                ],
+                [280],
+            )
+            self.assertEqual(issues, [])
+
+    def test_inspect_color_prep_timeline_fails_on_default_start_timecode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_session(root, reference_angle=None)
+            session = load_session(root / "session.yaml")
+            project = FakeResolveProject()
+            timeline = FakeResolveTimeline(session.resolve.color_prep_timeline_name)
+            project.timelines.append(timeline)
+
+            _take_ref, take = list(iter_session_takes(session))[0]
+            for track_index, camera in enumerate(take.camera_files, start=1):
+                timeline.add_item("video", track_index, FakeTimelineItem(camera.label, 0))
+            timeline.add_item("audio", 1, FakeTimelineItem("audio-master", 0))
+            timeline.AddMarker(0, "Blue", "take-01", "", 1, "piano_guard:color_prep:take-01")
+
+            _payload, issues = resolve_ops._inspect_color_prep_timeline(project, session)
+
+            self.assertIn("color_prep_start_timecode_mismatch", {issue.code for issue in issues})
+
+    def test_color_prep_timeline_preserves_existing_unless_rebuild_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_session(root, reference_angle=None)
+            session = load_session(root / "session.yaml")
+            project = FakeResolveProject()
+            existing = FakeResolveTimeline(session.resolve.color_prep_timeline_name)
+            project.timelines.append(existing)
+            media_pool = FakeResolveMediaPool(project)
+            takes_root = _fake_takes_root(session)
+            timelines_folder = FakeResolveFolder("Timelines")
+
+            preserved = resolve_ops._build_color_prep_timeline(
+                project=project,
+                media_pool=media_pool,
+                takes_root=takes_root,
+                timelines_folder=timelines_folder,
+                session=session,
+                rebuild=False,
+            )
+
+            self.assertEqual(preserved["status"], "WARN")
+            self.assertEqual(preserved["action"], "preserved-existing")
+            self.assertEqual(len(project.timelines), 1)
+            self.assertEqual(media_pool.append_calls, [])
+
+            with mock.patch.object(
+                resolve_ops,
+                "_estimate_color_prep_sync_offset",
+                return_value={"offset_frames": 0, "offset_seconds": 0.0, "confidence": 1.0},
+            ):
+                rebuilt = resolve_ops._build_color_prep_timeline(
+                    project=project,
+                    media_pool=media_pool,
+                    takes_root=takes_root,
+                    timelines_folder=timelines_folder,
+                    session=session,
+                    rebuild=True,
+                )
+
+            self.assertEqual(rebuilt["status"], "PASS")
+            self.assertEqual(rebuilt["action"], "rebuilt")
+            self.assertEqual(len(project.timelines), 1)
+            self.assertIsNot(project.timelines[0], existing)
+            self.assertTrue(media_pool.append_calls)
+
+    def test_inspect_color_prep_timeline_reports_missing_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_session(root, reference_angle=None)
+            session = load_session(root / "session.yaml")
+            project = FakeResolveProject()
+            timeline = FakeResolveTimeline(session.resolve.color_prep_timeline_name)
+            project.timelines.append(timeline)
+
+            payload, issues = resolve_ops._inspect_color_prep_timeline(project, session)
+
+            self.assertTrue(payload["exists"])
+            self.assertIn("color_prep_take_marker_missing", {issue.code for issue in issues})
+            self.assertIn("color_prep_angle_item_missing", {issue.code for issue in issues})
+            self.assertIn("color_prep_audio_item_missing", {issue.code for issue in issues})
+
+    def test_color_prep_sync_offset_is_signed(self) -> None:
+        master = np.zeros(30, dtype=np.float32)
+        master[10] = 1.0
+        late_video = np.zeros(20, dtype=np.float32)
+        late_video[7] = 1.0
+        early_video = np.zeros(20, dtype=np.float32)
+        early_video[12] = 1.0
+
+        with mock.patch.object(resolve_ops, "_color_prep_sync_envelope", side_effect=[master, late_video]):
+            late = resolve_ops._estimate_color_prep_sync_offset(Path("audio.aif"), Path("angle-a.mp4"), frame_rate=20.0)
+        with mock.patch.object(resolve_ops, "_color_prep_sync_envelope", side_effect=[master, early_video]):
+            early = resolve_ops._estimate_color_prep_sync_offset(Path("audio.aif"), Path("angle-b.mp4"), frame_rate=20.0)
+
+        self.assertEqual(late["offset_frames"], 3)
+        self.assertEqual(early["offset_frames"], -2)
 
     def test_resolve_storage_locations_repoint_offline_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

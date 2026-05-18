@@ -11,14 +11,14 @@ This repository handles the preparation work:
 - Group `/incoming/` media into takes and angles.
 - Create and validate the Resolve project.
 - Configure HLG -> SDR Rec.709 color management.
-- Import media and create waveform-synced take timelines.
+- Import media, waveform-sync sources, and create `00_color_prep_all_takes`.
 - Generate an operator handoff for the manual Resolve work.
 
 This repository does not own the final creative work:
 
 - Multicam clip creation.
 - Angle switching.
-- Manual color grading.
+- Manual color judgment.
 - Final editorial decisions.
 - YouTube export choices.
 - AI CDL auto-application.
@@ -72,6 +72,14 @@ When running the CLI directly:
 `prepare-resolve-session` also writes the operator handoff automatically after a
 successful bootstrap.
 
+If `00_color_prep_all_takes` already exists, it is preserved by default so
+manual grades are not destroyed. Rebuild it only when you explicitly want a
+fresh color-prep timeline:
+
+```bash
+./scripts/pg prepare-resolve-session "<session-root>" --rebuild-color-prep --json
+```
+
 ## 3. Stage A: Auto Grouping
 
 `group-session` moves and normalizes `incoming/` media into take folders.
@@ -102,6 +110,9 @@ Check:
 - Take count matches the session.
 - Each take has the expected angles.
 - Each take has external audio.
+- `reports/auto-group-plan.md` shows the intended angle labeling, lane IDs,
+  source filenames, and confidence scores. Treat this as part of E2E
+  acceptance.
 - `session.yaml` exists.
 - No obvious take or angle is missing.
 
@@ -114,8 +125,8 @@ It performs:
 - Resolve project creation/opening.
 - Project library checks.
 - Media import.
-- Take timeline creation.
 - Waveform sync.
+- `00_color_prep_all_takes` creation.
 - `audio-edit.wav` proxy creation when needed.
 - Cache, gallery stills, and backup path setup.
 - `.drp` project snapshot export.
@@ -141,10 +152,36 @@ Notes:
 - `timelinePlaybackFrameRate=24` is a warning.
 - Fix the timeline playback frame rate manually to 29.97 before editorial
   assembly or export.
+- Existing `00_color_prep_all_takes` timelines are preserved on rerun unless
+  `--rebuild-color-prep` is passed.
 - If Resolve cache/stills storage warnings appear, restart Resolve and rerun
   `prepare-resolve-session`.
+- `prepare-resolve-session` performs post-reload verification by saving,
+  closing, reloading, and inspecting the Resolve project before reporting
+  success.
 
-## 5. Read the Operator Handoff
+## 5. Read the Markdown Reports
+
+Start with the Markdown files:
+
+```text
+<session-root>/reports/prepare-resolve-session.md
+<session-root>/reports/inspect-resolve-session.md
+<session-root>/reports/auto-group-plan.md
+<session-root>/reports/operator-handoff.md
+```
+
+The JSON reports remain available for automation, but the Markdown reports are
+the human-facing source of truth.  Check `prepare-resolve-session.md` for:
+
+- auto-group angle labeling in `auto-group-plan.md`;
+- stage status;
+- post-reload verification;
+- color prep layout, angles, markers, and track count;
+- take-by-take placement;
+- low sync-confidence warnings.
+
+## 6. Read the Operator Handoff
 
 Generated files:
 
@@ -157,6 +194,7 @@ The handoff includes:
 
 - Session information.
 - Resolve project name.
+- Color-prep timeline name.
 - Take list.
 - Angle and audio files per take.
 - Expected color management.
@@ -165,7 +203,7 @@ The handoff includes:
 
 Use this file as the checklist before entering manual Resolve work.
 
-## 6. Optional Review Aids
+## 7. Optional Review Aids
 
 These commands create visual review material only. They do not apply grades.
 
@@ -186,54 +224,50 @@ Generated files:
 Use these to check angle coverage, broad exposure/color issues, and missing
 camera coverage before or during manual grading.
 
-## 7. Create Multicam Clips in Resolve
+## 8. Grade the Color-Prep Timeline
 
-Work one take at a time.
-
-In the Media Pool, select the take's angle videos and external audio:
+Open:
 
 ```text
-angle-a.mp4
-angle-b.mp4
-angle-c.mp4
-audio.aif / audio-edit.wav
+00_color_prep_all_takes
 ```
 
-Right-click and choose:
+This timeline uses a compact layout.  Semantic angle labels can span the
+whole session (`angle-a`, `angle-b`, ..., including different day/night camera
+setups), but each take is packed onto the first available video tracks:
 
 ```text
-Create New Multicam Clip Using Selected Clips
+V3: take-01 angle-c --- gap --- take-02 angle-f --- gap --- ...
+V2: take-01 angle-b --- gap --- take-02 angle-e --- gap --- ...
+V1: take-01 angle-a --- gap --- take-02 angle-d --- gap --- ...
+A1: master audio take-01 --- gap --- take-02 --- gap --- ...
 ```
 
-Use:
+The video tracks are named `compact-v1`, `compact-v2`, and so on.  The clip
+items keep the semantic angle labels, so the Color page still shows which
+angle you are grading while avoiding sparse empty tracks. The video items are
+video-only and the audio track is the external `audio.aif` / `audio-edit.wav`
+path. Camera scratch audio is not placed in this timeline.
 
-```text
-Sync: Sound
-Angle Name: Clip Name or Metadata
-```
-
-After creation, right-click the multicam clip:
-
-```text
-Open in Timeline
-```
-
-Confirm:
-
-- Every angle is synchronized.
-- External audio is synchronized.
-- Camera scratch audio is muted, disabled, or deleted after sync.
-- Final audio comes only from the external audio file.
-
-## 8. Grade Inside Each Multicam Timeline
-
-With the multicam clip open in timeline, go to the Color page.
+Go to the Color page and work on the source angle timeline items.
 
 Standard policy:
 
 ```text
 Use Local Grades
 ```
+
+Before grading, make the viewer unambiguous:
+
+```text
+Image Wipe / Split / Highlight: OFF
+Gallery hover preview: avoid while judging the current clip
+```
+
+`Image Wipe`, `Split`, and `Highlight` are comparison modes for stills or other
+shots. Turn them off while making base corrections or grabbing stills. If a
+vertical split, checkerboard, highlight overlay, or A/B comparison is visible,
+you are not looking at the current clip by itself.
 
 Goal:
 
@@ -259,6 +293,17 @@ Suggested adjustment order:
 5. Highlights / shadows.
 6. Look refinements if needed.
 
+Safe per-angle grading loop:
+
+1. Click the target source angle clip in the Color page filmstrip.
+2. Confirm wipe/split/highlight comparison is off.
+3. Make the Local Grade.
+4. Move to the next angle or take and repeat.
+
+Do not use Remote Grades, Shared Nodes, or CDL commands for the standard
+workflow. One source is used once, so Local Grades plus stills are safer and
+easier to reason about.
+
 ## 9. Reuse Looks With Gallery Stills
 
 After one take is matched, save stills for each angle.
@@ -277,21 +322,53 @@ take01_angle_b_base
 take01_angle_c_base
 ```
 
+Do not rely on Resolve's automatic still names such as `1.2.1` or `3.1.2` for
+take/angle meaning. Rename every useful still immediately.
+
+Gallery still behavior:
+
+- A still stores a frame image plus grade metadata.
+- Hovering or selecting a still can preview that still or its grade in the
+  viewer.
+- Hover/preview does not apply the grade to the current clip.
+- Only `Apply Grade` changes the selected clip.
+- If Image Wipe/Split/Highlight is on, the viewer may show the Gallery still
+  and current clip at the same time.
+
+Safe still capture:
+
+1. Open `00_color_prep_all_takes`.
+2. Go to the Color page.
+3. Turn `Image Wipe`, `Split`, and `Highlight` off.
+4. Do not hover over Gallery stills while judging the current frame.
+5. Click the target angle clip in the Color page filmstrip.
+6. Stop playback on the frame you want to save.
+7. Right-click the viewer and choose `Grab Still`.
+8. Rename the new still immediately with take and angle.
+
 For the next take:
 
-1. Open that take's multicam clip in timeline.
-2. Go to the Color page.
-3. Select the matching angle.
-4. Right-click the Gallery Still.
-5. Apply Grade.
-6. Adjust exposure and white balance for the new take.
+1. Stay in `00_color_prep_all_takes`.
+2. Select the matching angle in the next take.
+3. Right-click the renamed Gallery Still.
+4. Apply Grade.
+5. Adjust exposure and white balance for the new take.
 
 Treat stills as starting points, not finished copies.
 
-## 10. Build the Piece Timeline
+## 10. Manual Multicam Conversion
 
-After each take's multicam clip is color-matched internally, assemble the piece
-timeline.
+After color prep, duplicate `00_color_prep_all_takes` before multicam
+conversion or downstream editing. Keep the original color-prep timeline as the
+grade source you can return to.
+
+Manual multicam conversion is intentionally outside this repo's standard
+automation. If conversion or editing damages the structure, rebuild from the
+duplicate rather than overwriting the color-prep source.
+
+## 11. Build the Piece Timeline
+
+After color prep and manual multicam conversion, assemble the piece timeline.
 
 Example:
 
@@ -310,9 +387,9 @@ Do here:
 - Removing unused material.
 - Audio confirmation.
 
-The multicam-internal angle matching should already be done before this stage.
+The source angle matching should already be done before this stage.
 
-## 11. Final Timeline Finishing
+## 12. Final Timeline Finishing
 
 Apply only light Local Grades on the final piece timeline.
 
@@ -322,10 +399,11 @@ Use final timeline grades for:
 - Minor global brightness matching.
 - Final tone polish.
 
-Do not fix angle-specific problems here. If one angle is wrong, open that
-multicam clip in timeline and fix the source angle there.
+Do not fix angle-specific problems here. If one angle is wrong, return to
+`00_color_prep_all_takes` or its duplicated source timeline and fix the source
+angle there.
 
-## 12. Audio Cleanup
+## 13. Audio Cleanup
 
 The final timeline should use only the external audio path.
 
@@ -336,7 +414,7 @@ Confirm:
 - Take boundaries are not audibly abrupt.
 - If needed, replace with a Logic/DAW-processed final audio file.
 
-## 13. Pre-Export Checklist
+## 14. Pre-Export Checklist
 
 Check before export:
 
@@ -355,7 +433,7 @@ Skin tone: natural when visible
 If the project still warns about `timelinePlaybackFrameRate=24`, fix it
 manually before export.
 
-## 14. YouTube SDR Export
+## 15. YouTube SDR Export
 
 In the Deliver page, export as SDR.
 
@@ -374,7 +452,7 @@ Audio: AAC or PCM stereo
 This workflow is for YouTube SDR. HDR/HLG delivery should be treated as a
 separate workflow.
 
-## 15. CLI Summary
+## 16. CLI Summary
 
 Standard path:
 
@@ -402,19 +480,20 @@ Experimental only:
 
 Do not use CDL commands for the standard workflow.
 
-## 16. Shortest Practical Route
+## 17. Shortest Practical Route
 
 ```text
 1. Put media into <session-root>/incoming.
 2. Run the skill/CLI through Stage A/B.
 3. Read reports/operator-handoff.md.
-4. In Resolve, create one multicam clip per take.
-5. Open each multicam clip in timeline.
-6. Match angles with Local Grades.
-7. Use Gallery Stills as starting points for the next take.
-8. Assemble multicam clips into the piece timeline.
-9. Switch angles and cut.
-10. Lightly finish on the final timeline.
-11. Confirm 29.97, Rec.709, and external-only audio.
-12. Export SDR for YouTube.
+4. Open `00_color_prep_all_takes`.
+5. In Color page, turn wipe/split/highlight off.
+6. Match source angle clips with Local Grades.
+7. Rename Gallery Stills and use them as starting points for the next take.
+8. Duplicate the color-prep timeline before manual multicam conversion.
+9. Assemble the piece timeline.
+10. Switch angles and cut.
+11. Lightly finish on the final timeline.
+12. Confirm 29.97, Rec.709, and external-only audio.
+13. Export SDR for YouTube.
 ```

@@ -38,6 +38,8 @@ class ResolveConfig:
     project_snapshots_dir: str = "resolve"
     takes_bin: str = "Takes"
     timelines_bin: str = "Timelines"
+    color_prep_timeline_name: str = "00_color_prep_all_takes"
+    color_prep_gap_seconds: float = 5.0
 
 
 @dataclass

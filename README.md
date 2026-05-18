@@ -4,9 +4,10 @@ DaVinci Resolve session bootstrap for multi-camera piano recordings. This
 repository is self-contained: the bundled `piano-guard` CLI in
 `src/piano_guard/` is the canonical implementation for this skill.
 
-The standard workflow now stops at a manual Resolve handoff. Color and
-editorial work happen in Resolve with multicam timelines, Local Grades, and
-Gallery Stills.
+The standard workflow now creates a Resolve color-prep timeline and stops at a
+manual Resolve handoff. Color and editorial decisions still happen in Resolve,
+but source angle matching starts in `00_color_prep_all_takes` before manual
+multicam conversion.
 
 For the full operational workflow, see [WORKFLOW.md](WORKFLOW.md).
 
@@ -19,6 +20,7 @@ In scope:
 - Audio edit proxy generation when needed.
 - Resolve cache, gallery stills, and project backup storage preflight.
 - Sony α6400 PP10 HLG -> YouTube SDR Rec.709 project color management.
+- Cross-take `00_color_prep_all_takes` timeline creation for Local Grades.
 - Project inspection and `reports/operator-handoff.md`.
 - Optional still/contact-sheet generation for manual review.
 
@@ -29,7 +31,8 @@ Out of scope:
 - AI CDL autopilot as a production path.
 - LUT delivery.
 - Logic Pro automation.
-- Final multicam editing, manual color grading, and export decisions.
+- Automatic multicam conversion.
+- Manual color judgment, final multicam editing, and export decisions.
 
 ## First-Time Setup
 
@@ -74,7 +77,10 @@ After bootstrap:
 │       └── take.yaml
 ├── reports/
 │   ├── prepare-resolve-session.json
+│   ├── prepare-resolve-session.md
+│   ├── auto-group-plan.md
 │   ├── inspect-resolve-session.json
+│   ├── inspect-resolve-session.md
 │   ├── operator-handoff.md
 │   ├── operator-handoff.json
 │   ├── render-stills.json
@@ -99,6 +105,29 @@ Run directly from this checkout:
 `prepare-resolve-session` writes `operator-handoff.md` automatically when it
 completes successfully. Running `operator-handoff` separately is useful after
 manual changes to `session.yaml` or take metadata.
+
+Human review should start with:
+
+```text
+<session-root>/reports/prepare-resolve-session.md
+<session-root>/reports/auto-group-plan.md
+<session-root>/reports/inspect-resolve-session.md
+<session-root>/reports/operator-handoff.md
+```
+
+The JSON files remain for tooling, but the Markdown reports are the primary
+operator-facing output. `prepare-resolve-session` now saves, closes, reloads,
+and re-inspects the Resolve project before reporting success, so timeline items
+that disappear after reload are caught automatically.
+`auto-group-plan.md` is the labeling acceptance report: check angle labels,
+lane IDs, source filenames, and grouping confidence before proceeding.
+
+By default, an existing `00_color_prep_all_takes` timeline is preserved so
+manual grades are not destroyed on rerun. To intentionally rebuild it:
+
+```bash
+./scripts/pg prepare-resolve-session "<session-root>" --rebuild-color-prep --json
+```
 
 Expected Resolve color management:
 
@@ -134,19 +163,22 @@ before manual grading.
 
 After bootstrap:
 
-1. In Resolve, create one multicam clip per take from all angle videos plus the
-   final external audio.
-2. Use `Sound` sync.
-3. Right-click the multicam clip and choose `Open in Timeline`.
-4. Confirm sync, then disable or delete camera scratch audio. Keep only the
-   external AIF/WAV audio for final use.
-5. On the Color page, use Local Grades inside the multicam timeline.
-6. Match angles within the same take first.
-7. Save angle grades as Gallery Stills and use them as starting points for the
-   next take.
-8. Assemble the graded multicam clips into the piece timeline.
-9. Perform angle switching and final edit.
-10. Use final timeline grades only for light take-to-take finishing.
+1. Open `00_color_prep_all_takes`.
+2. Confirm the project color management is still the expected HLG -> SDR
+   Rec.709 path.
+3. Use the compact video tracks (`compact-v1`, `compact-v2`, ...) as packed
+   rows; the clip item names keep the semantic labels such as `angle-a` through
+   `angle-f`.
+4. On the Color page, use Local Grades on the source angle timeline items.
+5. Match angles within the same take first.
+6. Save useful angle grades as Gallery Stills and apply them as starting points
+   for the same angle in the next take, then adjust independently.
+7. Do not use Remote Grades, Shared Nodes, or CDL commands for the standard
+   workflow.
+8. Duplicate the color-prep timeline before manual multicam conversion or
+   downstream editing.
+9. Use final timeline grades only for light take-to-take finishing after edit
+   lock.
 
 ## Experimental CDL Tools
 
