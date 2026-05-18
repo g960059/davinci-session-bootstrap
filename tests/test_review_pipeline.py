@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -391,6 +392,28 @@ class ReviewPipelineTests(unittest.TestCase):
             self.assertIn("CDL commands are experimental", text)
             self.assertEqual(payload["take_count"], 1)
             self.assertEqual(payload["takes"][0]["edit_audio"], "audio.wav")
+
+    def test_take_order_report_uses_same_angle_file_times(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            takes = {
+                "take-01": ["angle-a", "angle-b"],
+                "take-02": ["angle-a", "angle-b"],
+                "take-03": ["angle-a", "angle-b"],
+            }
+            _write_session(root, reference_angle=None, takes=takes)
+            order_times = {"take-02": 1000.0, "take-03": 2000.0, "take-01": 3000.0}
+            for take_id, timestamp in order_times.items():
+                take_dir = root / "takes" / take_id
+                for filename in ["audio.wav", "angle-a.mp4", "angle-b.mp4"]:
+                    os.utime(take_dir / filename, (timestamp, timestamp))
+            session = load_session(root / "session.yaml")
+
+            _json_path, markdown_path, report = autogroup.write_take_order_reports(session)
+
+            self.assertEqual([entry.take_id for entry in report.inferred_order], ["take-02", "take-03", "take-01"])
+            self.assertTrue(markdown_path.is_file())
+            self.assertIn("take-02 -> take-03 -> take-01", markdown_path.read_text(encoding="utf-8"))
 
     def test_cli_help_shows_standard_pipeline_and_hides_cdl_commands(self) -> None:
         stdout = io.StringIO()

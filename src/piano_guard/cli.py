@@ -15,6 +15,7 @@ from piano_guard.autogroup import (
     auto_group_plan_to_dict,
     plan_auto_group,
     write_auto_group_plan_reports,
+    write_take_order_reports,
 )
 from piano_guard.config import (
     AUDIO_EXTENSIONS,
@@ -348,11 +349,15 @@ def command_group_session(args: argparse.Namespace) -> int:
             project_library_name=args.project_library_name,
             project_library_path=args.project_library_path,
         )
+        take_order_json_path, take_order_markdown_path, take_order_report = write_take_order_reports(session)
         payload = {
             "status": "PASS",
             "summary": f"session already grouped; {len(session.takes)} takes available",
             "session_config": str(session.session_path),
             "take_count": len(session.takes),
+            "take_order_status": take_order_report.status,
+            "take_order_path": str(take_order_markdown_path),
+            "take_order_json_path": str(take_order_json_path),
         }
         _emit(payload, as_json=args.json)
         return 0
@@ -382,6 +387,7 @@ def command_group_session(args: argparse.Namespace) -> int:
         project_library_name=args.project_library_name,
         project_library_path=args.project_library_path,
     )
+    take_order_json_path, take_order_markdown_path, take_order_report = write_take_order_reports(session)
     payload = {
         "status": apply_result.status,
         "summary": f"applied {len(apply_result.takes_created)} takes",
@@ -390,6 +396,9 @@ def command_group_session(args: argparse.Namespace) -> int:
         "excluded_created": apply_result.excluded_created,
         "auto_group_plan_path": str(plan_markdown_path),
         "auto_group_apply_path": str(session_root / "reports" / "auto-group-apply.md"),
+        "take_order_status": take_order_report.status,
+        "take_order_path": str(take_order_markdown_path),
+        "take_order_json_path": str(take_order_json_path),
     }
     _emit(payload, as_json=args.json)
     return 0

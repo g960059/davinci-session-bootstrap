@@ -113,6 +113,9 @@ Check:
 - `reports/auto-group-plan.md` shows the intended angle labeling, lane IDs,
   source filenames, and confidence scores. Treat this as part of E2E
   acceptance.
+- `reports/take-order.md` shows the inferred shooting order. Same-angle source
+  file times are the strongest evidence; cross-setup merges are marked as
+  tentative and do not rename take folders.
 - `session.yaml` exists.
 - No obvious take or angle is missing.
 

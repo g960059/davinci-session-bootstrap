@@ -111,6 +111,7 @@ Human review should start with:
 ```text
 <session-root>/reports/prepare-resolve-session.md
 <session-root>/reports/auto-group-plan.md
+<session-root>/reports/take-order.md
 <session-root>/reports/inspect-resolve-session.md
 <session-root>/reports/operator-handoff.md
 ```
@@ -121,6 +122,9 @@ and re-inspects the Resolve project before reporting success, so timeline items
 that disappear after reload are caught automatically.
 `auto-group-plan.md` is the labeling acceptance report: check angle labels,
 lane IDs, source filenames, and grouping confidence before proceeding.
+`take-order.md` is a non-destructive shooting-order estimate. It orders takes
+inside the same angle label by source file modification time, then reports a
+tentative global order without renaming folders or changing Resolve timelines.
 
 By default, an existing `00_color_prep_all_takes` timeline is preserved so
 manual grades are not destroyed on rerun. To intentionally rebuild it:

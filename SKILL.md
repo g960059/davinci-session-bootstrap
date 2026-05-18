@@ -49,6 +49,9 @@ ${CLAUDE_SKILL_DIR}/scripts/pg group-session "<session-root>" --json
 - Read `<session-root>/reports/auto-group-plan.md` and verify angle labeling:
   expected angle count, per-take labels, source filenames, lane IDs, and scores.
   Labeling is part of E2E acceptance, not just a grouping implementation detail.
+- Read `<session-root>/reports/take-order.md` when present. It is a
+  non-destructive shooting-order estimate based on same-angle file times; use it
+  for human acceptance, not as proof that take folders were renamed.
 - Use only `<session-root>/incoming/` by default. Do not look for
   `<session-root>/incomings/` unless the operator explicitly passes
   `--incoming-dir`.

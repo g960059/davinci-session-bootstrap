@@ -15,8 +15,10 @@ from scipy.spatial.distance import squareform
 
 from piano_guard.config import (
     AUDIO_EXTENSIONS,
+    SessionProjectConfig,
     VIDEO_EXTENSIONS,
     initialize_session,
+    iter_session_takes,
     load_session,
     write_session,
 )
@@ -90,6 +92,42 @@ class AutoGroupApplyResult:
     files_moved: list[dict[str, str]]
     session_config: str
     status: str
+
+
+@dataclass
+class TakeOrderEvidenceItem:
+    take_id: str
+    source: str
+    timestamp: float
+    timestamp_text: str
+
+
+@dataclass
+class TakeOrderEvidenceGroup:
+    group: str
+    media_type: str
+    method: str
+    items: list[TakeOrderEvidenceItem]
+
+
+@dataclass
+class TakeOrderEntry:
+    position: int
+    take_id: str
+    confidence: str
+    evidence_groups: int
+    average_rank: float
+    group_positions: dict[str, int]
+
+
+@dataclass
+class TakeOrderReport:
+    session_root: str
+    generated_at: str
+    status: str
+    inferred_order: list[TakeOrderEntry]
+    evidence_groups: list[TakeOrderEvidenceGroup]
+    issues: list[Issue]
 
 
 @dataclass
@@ -1037,6 +1075,222 @@ def write_auto_group_plan_reports(piece_root: str | Path, plan: AutoGroupPlan) -
     markdown_path.parent.mkdir(parents=True, exist_ok=True)
     markdown_path.write_text("\n".join(lines), encoding="utf-8")
     return json_path, markdown_path
+
+
+def _take_order_timestamp(path: Path) -> float:
+    stat = path.stat()
+    # Modification time survives normal moves/renames and is more useful here
+    # than birth time, which can reflect when a randomized test hardlink was
+    # created rather than when the camera/audio file was recorded.
+    return float(stat.st_mtime)
+
+
+def _take_order_time_text(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
+
+
+def _take_order_confidence(evidence_count: int) -> str:
+    if evidence_count >= 3:
+        return "high"
+    if evidence_count == 2:
+        return "medium"
+    if evidence_count == 1:
+        return "low"
+    return "none"
+
+
+def _order_evidence_group(
+    *,
+    group: str,
+    media_type: str,
+    method: str,
+    items: list[tuple[str, Path]],
+) -> TakeOrderEvidenceGroup | None:
+    evidence_items: list[TakeOrderEvidenceItem] = []
+    for take_id, path in items:
+        if not path.exists():
+            continue
+        timestamp = _take_order_timestamp(path)
+        evidence_items.append(
+            TakeOrderEvidenceItem(
+                take_id=take_id,
+                source=path.name,
+                timestamp=timestamp,
+                timestamp_text=_take_order_time_text(timestamp),
+            )
+        )
+    if len(evidence_items) < 2:
+        return None
+    evidence_items.sort(key=lambda item: (item.timestamp, item.source, item.take_id))
+    return TakeOrderEvidenceGroup(group=group, media_type=media_type, method=method, items=evidence_items)
+
+
+def build_take_order_report(session: SessionProjectConfig) -> TakeOrderReport:
+    angle_sources: dict[str, list[tuple[str, Path]]] = {}
+    audio_sources: list[tuple[str, Path]] = []
+    take_ids: list[str] = []
+
+    for take_ref, take in iter_session_takes(session):
+        take_ids.append(take_ref.id)
+        master_audio = take.resolve_path(take.master_audio)
+        audio_sources.append((take_ref.id, master_audio))
+        for camera in take.camera_files:
+            angle_sources.setdefault(camera.label, []).append((take_ref.id, take.resolve_path(camera.file)))
+
+    evidence_groups: list[TakeOrderEvidenceGroup] = []
+    for angle in sorted(angle_sources):
+        group = _order_evidence_group(
+            group=angle,
+            media_type="video",
+            method="mtime within same angle label",
+            items=angle_sources[angle],
+        )
+        if group is not None:
+            evidence_groups.append(group)
+
+    audio_group = _order_evidence_group(
+        group="audio-master",
+        media_type="audio",
+        method="mtime across master audio files",
+        items=audio_sources,
+    )
+    if audio_group is not None:
+        evidence_groups.append(audio_group)
+
+    issues: list[Issue] = []
+    video_group_take_sets = {
+        frozenset(item.take_id for item in group.items)
+        for group in evidence_groups
+        if group.media_type == "video"
+    }
+    if len(video_group_take_sets) > 1:
+        issues.append(
+            _serialize_issue(
+                "take_order_cross_setup_ambiguous",
+                "video metadata forms multiple angle/setup groups; order inside each shared-angle group is stronger than the global merge",
+                severity="warn",
+                context={
+                    "video_groups": [
+                        sorted(group) for group in sorted(video_group_take_sets, key=lambda item: sorted(item))
+                    ]
+                },
+            )
+        )
+
+    audio_rank: dict[str, int] = {}
+    if audio_group is not None and {item.take_id for item in audio_group.items} == set(take_ids):
+        audio_rank = {item.take_id: index for index, item in enumerate(audio_group.items)}
+
+    ranks_by_take: dict[str, list[float]] = {take_id: [] for take_id in take_ids}
+    positions_by_take: dict[str, dict[str, int]] = {take_id: {} for take_id in take_ids}
+    for group in evidence_groups:
+        denominator = max(len(group.items) - 1, 1)
+        for index, item in enumerate(group.items):
+            ranks_by_take.setdefault(item.take_id, []).append(index / denominator)
+            positions_by_take.setdefault(item.take_id, {})[group.group] = index + 1
+
+    inferred: list[TakeOrderEntry] = []
+    for take_id in take_ids:
+        ranks = ranks_by_take.get(take_id) or []
+        average_rank = sum(ranks) / len(ranks) if ranks else 999.0
+        inferred.append(
+            TakeOrderEntry(
+                position=0,
+                take_id=take_id,
+                confidence=_take_order_confidence(len(ranks)),
+                evidence_groups=len(ranks),
+                average_rank=average_rank,
+                group_positions=positions_by_take.get(take_id, {}),
+            )
+        )
+    if len(video_group_take_sets) > 1 and audio_rank:
+        inferred.sort(key=lambda entry: (audio_rank.get(entry.take_id, 999), entry.average_rank, entry.take_id))
+    else:
+        inferred.sort(key=lambda entry: (entry.average_rank, entry.take_id))
+    for index, entry in enumerate(inferred, start=1):
+        entry.position = index
+
+    if any(entry.evidence_groups == 0 for entry in inferred):
+        missing = [entry.take_id for entry in inferred if entry.evidence_groups == 0]
+        issues.append(
+            _serialize_issue(
+                "take_order_evidence_missing",
+                f"missing order evidence for {', '.join(missing)}",
+                severity="warn",
+                context={"takes": missing},
+            )
+        )
+
+    return TakeOrderReport(
+        session_root=str(session.session_root),
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        status=overall_status(issues),
+        inferred_order=inferred,
+        evidence_groups=evidence_groups,
+        issues=issues,
+    )
+
+
+def take_order_report_to_dict(report: TakeOrderReport) -> dict[str, Any]:
+    payload = asdict(report)
+    payload["issues"] = issues_to_dict(report.issues)
+    return payload
+
+
+def write_take_order_reports(session: SessionProjectConfig) -> tuple[Path, Path, TakeOrderReport]:
+    report = build_take_order_report(session)
+    payload = take_order_report_to_dict(report)
+    json_path = session.reports_path("take-order.json")
+    markdown_path = session.reports_path("take-order.md")
+    write_json_report(json_path, payload)
+
+    lines = [
+        "# Take Order Report",
+        "",
+        f"- Status: {report.status}",
+        f"- Generated at: {report.generated_at}",
+        "- Method: same-angle files are ordered by file modification time; master audio is used only as additional weak global evidence.",
+        "- When video evidence is split across multiple setup groups, the global list uses master audio time as a weak bridge and reports a WARN.",
+        "- Scope: report only. It does not rename take folders or modify Resolve timelines.",
+        "",
+        "## Inferred Order",
+        "",
+        "| Position | Take | Confidence | Evidence Groups | Average Rank | Group Positions |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for entry in report.inferred_order:
+        group_positions = ", ".join(
+            f"{group}:{position}" for group, position in sorted(entry.group_positions.items())
+        )
+        lines.append(
+            f"| {entry.position} | {entry.take_id} | {entry.confidence} | {entry.evidence_groups} | "
+            f"{entry.average_rank:.3f} | {group_positions or '-'} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Evidence",
+            "",
+            "| Group | Type | Method | Ordered Takes | Source Times |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    for group in report.evidence_groups:
+        ordered_takes = " -> ".join(item.take_id for item in group.items)
+        source_times = "<br>".join(f"{item.take_id}: `{item.source}` {item.timestamp_text}" for item in group.items)
+        lines.append(f"| {group.group} | {group.media_type} | {group.method} | {ordered_takes} | {source_times} |")
+
+    if report.issues:
+        lines.extend(["", "## Issues", "", "| Severity | Code | Message |", "| --- | --- | --- |"])
+        for issue in report.issues:
+            message = issue.message.replace("|", "\\|")
+            lines.append(f"| {issue.severity} | {issue.code} | {message} |")
+
+    lines.append("")
+    markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    markdown_path.write_text("\n".join(lines), encoding="utf-8")
+    return json_path, markdown_path, report
 
 
 def _ensure_empty_output_root(root: Path, *, label: str) -> Path:
