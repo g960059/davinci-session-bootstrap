@@ -590,6 +590,7 @@ def _apply_project_settings(
       * Timeline color space: ``Rec.709 Gamma 2.4``.
       * Output color space: ``Rec.709 Gamma 2.4``.
       * Input / output DRT: ``DaVinci``.
+      * SDR working luminance for Rec.709/PP3 delivery.
 
     Automatic Color Management previously let Resolve report
     ``colorSpaceInput = Rec.709 Gamma 2.4`` on HLG clips, which made the
@@ -700,6 +701,34 @@ def _apply_project_settings(
         "useInverseDRT": _set_setting(
             project, "useInverseDRT", ["0"], required=False, mismatches=mismatches
         ),
+        "timelineWorkingLuminanceMode": _set_setting(
+            project,
+            "timelineWorkingLuminanceMode",
+            ["SDR 100"],
+            required=False,
+            mismatches=mismatches,
+        ),
+        "colorSpaceOutputToneLuminanceMax": _set_setting(
+            project,
+            "colorSpaceOutputToneLuminanceMax",
+            ["100"],
+            required=False,
+            mismatches=mismatches,
+        ),
+        "graphicsWhiteLevel": _set_setting(
+            project,
+            "graphicsWhiteLevel",
+            ["200"],
+            required=False,
+            mismatches=mismatches,
+        ),
+        "useColorSpaceAwareGradingTools": _set_setting(
+            project,
+            "useColorSpaceAwareGradingTools",
+            ["1"],
+            required=False,
+            mismatches=mismatches,
+        ),
     }
 
     # Informational: record the current RCM preset mode (not SetSet-managed).
@@ -723,6 +752,10 @@ def _read_project_color_settings(project: Any) -> dict[str, str]:
         "inputDRT": str(project.GetSetting("inputDRT")),
         "outputDRT": str(project.GetSetting("outputDRT")),
         "useInverseDRT": str(project.GetSetting("useInverseDRT")),
+        "timelineWorkingLuminanceMode": str(project.GetSetting("timelineWorkingLuminanceMode")),
+        "colorSpaceOutputToneLuminanceMax": str(project.GetSetting("colorSpaceOutputToneLuminanceMax")),
+        "graphicsWhiteLevel": str(project.GetSetting("graphicsWhiteLevel")),
+        "useColorSpaceAwareGradingTools": str(project.GetSetting("useColorSpaceAwareGradingTools")),
     }
 
 
@@ -737,6 +770,10 @@ def _expected_project_color_settings(timeline: TimelineConfig) -> dict[str, str]
         "inputDRT": "DaVinci",
         "outputDRT": "DaVinci",
         "useInverseDRT": "0",
+        "timelineWorkingLuminanceMode": "SDR 100",
+        "colorSpaceOutputToneLuminanceMax": "100",
+        "graphicsWhiteLevel": "200",
+        "useColorSpaceAwareGradingTools": "1",
     }
 
 

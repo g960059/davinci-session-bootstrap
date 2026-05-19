@@ -20,6 +20,7 @@
 - 動画と master audio は、まず全部 `incoming/` に入れる。
 - ファイル名はランダムでもよい。
 - take ごとの仕分けや angle 名付けは Codex に任せる。
+- 動画1本だけの撮影でもよい。その場合は `angle-a` の単一 take として扱う。
 - 元素材を他にも保存している場合でも、この作業フォルダ内に必要な動画・音声が残る状態にする。
 
 ## 2. Codex への頼み方
@@ -89,6 +90,15 @@ Resolve では `00_color_prep_all_takes` を開きます。
 - Playback frame rate: `29.97`
 - Input color space: `Rec.2100 HLG`
 - Timeline / Output color space: `Rec.709 Gamma 2.4`
+- Timeline working luminance: `SDR 100`
+- Output tone luminance max: `100`
+- Graphics white level: `200`
+- Use 203 nits reference for Rec.2100 HDR: off
+- Use inverse DRT for SDR to HDR conversion: off
+
+動画がすべて通常の `bt709` 素材だった場合は、Input color space も
+`Rec.709 Gamma 2.4` として扱います。PP3 / Rec.709 / グリーンバック /
+YouTube SDR の単一カメラ撮影はこの扱いです。
 
 特に Playback frame rate は Resolve scripting API で直せないことがあるので、
 `24` などになっていたら手動で `29.97` に直します。

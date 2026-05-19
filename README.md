@@ -16,12 +16,16 @@ For the full operational workflow, see [WORKFLOW.md](WORKFLOW.md).
 In scope:
 
 - Auto-grouping `incoming/` media into takes.
+- Single-camera sessions are supported; one video plus one master audio is a
+  valid production take.
 - Resolve project bootstrap and waveform sync.
 - Resolve waveform sync keeps each video clip's embedded scratch audio; each
   take bin keeps the angle clips plus a separate `audio-master` clip.
 - Audio edit proxy generation when needed.
 - Resolve cache, gallery stills, and project backup storage preflight.
 - Sony α6400 PP10 HLG -> YouTube SDR Rec.709 project color management.
+- All-Rec.709 source sessions are kept in Rec.709 instead of forcing the HLG
+  validation path.
 - Cross-take `00_color_prep_all_takes` timeline creation for Local Grades.
 - Project inspection and `reports/operator-handoff.md`.
 - Optional still/contact-sheet generation for manual review.
@@ -145,7 +149,17 @@ Timeline color space: Rec.709 Gamma 2.4
 Output color space: Rec.709 Gamma 2.4
 Input DRT: DaVinci
 Output DRT: DaVinci
+Timeline working luminance: SDR 100
+Output tone luminance max: 100
+Graphics white level: 200
+Use 203 nits reference for Rec.2100 HDR: Off for PP3/Rec.709 SDR
+Use inverse DRT for SDR to HDR conversion: Off
+Use color space aware grading tools: On
 ```
+
+If all video sources probe as `bt709` / `bt709` / `bt709`, the input color
+space is also set to `Rec.709 Gamma 2.4`. This covers PP3 / Rec.709 /
+single-camera green-screen sessions for YouTube SDR.
 
 `timelinePlaybackFrameRate=24` on a 29.97 project is reported as a warning
 because Resolve scripting cannot reliably change it; fix it manually before

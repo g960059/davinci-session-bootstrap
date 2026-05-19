@@ -30,6 +30,8 @@ AUDIO_SAMPLE_RATE = 11_025
 SIGNATURE_HZ = 20.0
 FRAME_SAMPLE_POSITIONS = (0.15, 0.35, 0.55, 0.75, 0.90)
 MAX_LANE_COUNT = 8
+MIN_PRODUCTION_VIDEO_COUNT = 1
+MAX_PRODUCTION_VIDEO_COUNT = MAX_LANE_COUNT
 NULL_ASSIGNMENT_SCORE = 0.40
 MIN_LANE_ASSIGNMENT_SCORE = 0.56
 MIN_PRODUCTION_TAKE_SCORE = 0.60
@@ -641,9 +643,13 @@ def _candidate_production_take_count(candidate: _CandidatePlan) -> int:
         if not assignments:
             continue
         confidence = float(np.mean([assignment.metrics.pair_score for assignment in assignments]))
-        if 3 <= len(assignments) <= 4 and confidence >= MIN_PRODUCTION_TAKE_SCORE:
+        if _is_production_take(assignments, confidence):
             count += 1
     return count
+
+
+def _is_production_take(assignments: list[_LaneAssignment], confidence: float) -> bool:
+    return MIN_PRODUCTION_VIDEO_COUNT <= len(assignments) <= MAX_PRODUCTION_VIDEO_COUNT and confidence >= MIN_PRODUCTION_TAKE_SCORE
 
 
 def _classify_candidate(
@@ -662,7 +668,7 @@ def _classify_candidate(
     for audio in audio_assets:
         assignments = sorted(audio_assignments[audio.relative_path], key=lambda item: item.video.relative_path)
         audio_assignments[audio.relative_path] = assignments
-        if 3 <= len(assignments) <= 4 and float(np.mean([item.metrics.pair_score for item in assignments])) >= MIN_PRODUCTION_TAKE_SCORE:
+        if _is_production_take(assignments, float(np.mean([item.metrics.pair_score for item in assignments]))):
             consumed_videos.update(item.video.relative_path for item in assignments)
             continue
 
@@ -889,7 +895,7 @@ def plan_auto_group(piece_root: str | Path, *, incoming_dir: str | None = None) 
         if not assignments:
             continue
         confidence = float(np.mean([assignment.metrics.pair_score for assignment in assignments]))
-        if not (3 <= len(assignments) <= 4 and confidence >= MIN_PRODUCTION_TAKE_SCORE):
+        if not _is_production_take(assignments, confidence):
             continue
         production_audio_paths.add(audio.relative_path)
 
@@ -972,7 +978,7 @@ def plan_auto_group(piece_root: str | Path, *, incoming_dir: str | None = None) 
             )
         )
     for take in takes:
-        if not 3 <= len(take.videos) <= 4:
+        if not MIN_PRODUCTION_VIDEO_COUNT <= len(take.videos) <= MAX_PRODUCTION_VIDEO_COUNT:
             issues.append(
                 _serialize_issue(
                     "take_size_invalid",

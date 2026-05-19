@@ -470,6 +470,67 @@ class ReviewPipelineTests(unittest.TestCase):
             self.assertIs(settings[FakeResolveApi.AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO], True)
             self.assertIs(settings[FakeResolveApi.AUDIO_SYNC_RETAIN_VIDEO_METADATA], True)
 
+    def test_single_video_take_is_valid_for_auto_grouping(self) -> None:
+        self.assertTrue(autogroup._is_production_take([object()], 0.70))
+        self.assertFalse(autogroup._is_production_take([], 0.70))
+        self.assertFalse(autogroup._is_production_take([object()], 0.50))
+
+    def test_prepare_adapts_all_bt709_sources_to_rec709_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_session(root, reference_angle=None, takes={"take-01": ["angle-a"]})
+            session = load_session(root / "session.yaml")
+
+            with mock.patch.object(
+                cli,
+                "probe_media",
+                return_value={
+                    "format": {"duration": "1"},
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "color_space": "bt709",
+                            "color_transfer": "bt709",
+                            "color_primaries": "bt709",
+                        }
+                    ],
+                },
+            ):
+                adapted = cli._adapt_session_color_from_sources(session)
+
+            self.assertEqual(adapted.timeline.input_color_space, "Rec.709 Gamma 2.4")
+            _take_ref, take = iter_session_takes(adapted)[0]
+            self.assertEqual(take.validation.expected_color_space, "bt709")
+            self.assertEqual(take.validation.expected_color_transfer, "bt709")
+            self.assertEqual(take.validation.expected_color_primaries, "bt709")
+
+    def test_project_settings_use_sdr_luminance_for_rec709(self) -> None:
+        class FakeSettingsProject:
+            def __init__(self) -> None:
+                self.settings: dict[str, str] = {"rcmPresetMode": "Custom"}
+
+            def SetSetting(self, key: str, value: object) -> bool:
+                self.settings[key] = str(value)
+                return True
+
+            def GetSetting(self, key: str | None = None) -> str | dict[str, str]:
+                if key in (None, ""):
+                    return dict(self.settings)
+                return self.settings.get(str(key), "")
+
+        project = FakeSettingsProject()
+        timeline = cli.TimelineConfig(input_color_space="Rec.709 Gamma 2.4")
+
+        settings, mismatches = resolve_ops._apply_project_settings(project, timeline)
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(settings["colorSpaceInput"], "Rec.709 Gamma 2.4")
+        self.assertEqual(settings["timelineWorkingLuminanceMode"], "SDR 100")
+        self.assertEqual(settings["colorSpaceOutputToneLuminanceMax"], "100")
+        self.assertEqual(settings["graphicsWhiteLevel"], "200")
+        self.assertEqual(settings["useInverseDRT"], "0")
+        self.assertEqual(settings["useColorSpaceAwareGradingTools"], "1")
+
     def test_cli_help_shows_standard_pipeline_and_hides_cdl_commands(self) -> None:
         stdout = io.StringIO()
         with self.assertRaises(SystemExit) as raised:

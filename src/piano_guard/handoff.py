@@ -44,6 +44,12 @@ def build_operator_handoff(session: SessionProjectConfig) -> dict[str, Any]:
         "output_color_space": session.timeline.output_color_space,
         "input_drt": "DaVinci",
         "output_drt": "DaVinci",
+        "timeline_working_luminance": "SDR 100",
+        "output_tone_luminance_max": "100",
+        "graphics_white_level": "200",
+        "use_203_nits_reference_for_rec2100_hdr": "off for PP3/Rec.709 SDR",
+        "use_inverse_drt_for_sdr_to_hdr": "off",
+        "use_color_space_aware_grading_tools": "on",
     }
     return {
         "status": "PASS",
@@ -120,7 +126,7 @@ def render_operator_handoff_markdown(payload: dict[str, Any]) -> str:
             "## Manual Resolve Workflow",
             "",
             f"1. Open `{payload['color_prep']['timeline_name']}`.",
-            "2. Confirm the project color management matches the expected HLG -> SDR Rec.709 settings above.",
+            "2. Confirm the project color management matches the expected Rec.709 / YouTube SDR settings above.",
             "3. Treat `compact-v1`, `compact-v2`, ... as packed rows; grade by each clip item's `angle-*` label.",
             "4. Go to the Color page and grade each source angle timeline item with Local Grades.",
             "5. Match angles within each take first: white keys, black piano finish, gold plate, skin when visible, and window highlights.",

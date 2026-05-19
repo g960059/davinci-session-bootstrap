@@ -32,6 +32,8 @@ Halt and surface the issue on any failure.
 
 1. `<session-root>/incoming/` exists and contains camera videos plus one or more
    audio files (`.wav`, `.aif`, `.aiff`, or `.flac`) for grouping.
+   Single-camera sessions are valid: one video plus one master audio can form
+   a production take.
 2. `${CLAUDE_SKILL_DIR}/.venv/bin/piano-guard` exists. If missing, ask the
    operator to run `${CLAUDE_SKILL_DIR}/scripts/install.sh`.
 3. DaVinci Resolve is running before Resolve-backed commands.
@@ -88,6 +90,17 @@ Expected Resolve color settings:
 - Timeline color space: `Rec.709 Gamma 2.4`.
 - Output color space: `Rec.709 Gamma 2.4`.
 - Input DRT / Output DRT: `DaVinci`.
+- Timeline working luminance: `SDR 100`.
+- Output tone luminance max: `100`.
+- Graphics white level: `200`.
+- Use 203 nits reference for Rec.2100 HDR: off for PP3/Rec.709 SDR sessions.
+- Use inverse DRT for SDR to HDR conversion: off.
+- Use color space aware grading tools: on.
+
+If every source video probes as `bt709` / `bt709` / `bt709`, use
+`Rec.709 Gamma 2.4` as the input color space and validate against bt709 rather
+than failing the HLG checks. This is the standard path for PP3 / Rec.709 /
+single-camera green-screen sessions intended for YouTube SDR.
 
 `timelinePlaybackFrameRate=24` on a 29.97 session is a WARN, not a blocker for
 bootstrap. It must be fixed manually before editorial assembly or export.

@@ -19,11 +19,15 @@ from piano_guard.autogroup import (
 )
 from piano_guard.config import (
     AUDIO_EXTENSIONS,
+    TimelineConfig,
     VIDEO_EXTENSIONS,
     initialize_session,
+    iter_session_takes,
     load_session,
     write_session,
+    write_take,
 )
+from piano_guard.fftools import first_stream, probe_media
 from piano_guard.handoff import write_operator_handoff
 from piano_guard.reports import write_json_report
 from piano_guard.resolve_ops import (
@@ -329,6 +333,39 @@ def _prepare_session_config(
     return load_session(session.session_path)
 
 
+def _adapt_session_color_from_sources(session: Any) -> Any:
+    signatures: set[tuple[str, str, str]] = set()
+    for _take_ref, take in iter_session_takes(session):
+        for camera in take.camera_files:
+            video_stream = first_stream(probe_media(take.resolve_path(camera.file)).get("streams", []), "video")
+            if video_stream is None:
+                continue
+            signatures.add(
+                (
+                    str(video_stream.get("color_space") or ""),
+                    str(video_stream.get("color_transfer") or ""),
+                    str(video_stream.get("color_primaries") or ""),
+                )
+            )
+
+    if signatures != {("bt709", "bt709", "bt709")}:
+        return session
+
+    session.timeline.input_color_space = "Rec.709 Gamma 2.4"
+    session.timeline.timeline_color_space = "Rec.709 Gamma 2.4"
+    session.timeline.output_color_space = "Rec.709 Gamma 2.4"
+    write_session(session)
+
+    for _take_ref, take in iter_session_takes(session):
+        take.timeline = TimelineConfig(**asdict(session.timeline))
+        take.validation.expected_color_space = "bt709"
+        take.validation.expected_color_transfer = "bt709"
+        take.validation.expected_color_primaries = "bt709"
+        write_take(take)
+
+    return load_session(session.session_path)
+
+
 def _validation_payload(validation: Any) -> dict[str, Any]:
     payload = session_validation_to_dict(validation)
     payload["summary"] = (
@@ -413,6 +450,7 @@ def command_prepare_resolve_session(args: argparse.Namespace) -> int:
         project_library_name=args.project_library_name,
         project_library_path=args.project_library_path,
     )
+    session = _adapt_session_color_from_sources(session)
     validation = inspect_session_project(session, write_take_reports=False)
     if validation.status == "FAIL":
         payload = _validation_payload(validation)

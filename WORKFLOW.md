@@ -145,7 +145,16 @@ Timeline color space: Rec.709 Gamma 2.4
 Output color space: Rec.709 Gamma 2.4
 Input DRT: DaVinci
 Output DRT: DaVinci
+Timeline working luminance: SDR 100
+Output tone luminance max: 100
+Graphics white level: 200
+Use 203 nits reference for Rec.2100 HDR: Off for PP3/Rec.709 SDR
+Use inverse DRT for SDR to HDR conversion: Off
+Use color space aware grading tools: On
 ```
+
+For all-`bt709` sources, including PP3 / Rec.709 / single-camera green-screen
+sessions, Input color space is `Rec.709 Gamma 2.4`.
 
 `inspect-resolve-session` must return `PASS` or `WARN`. Do not proceed to
 Resolve editing on `FAIL`.
