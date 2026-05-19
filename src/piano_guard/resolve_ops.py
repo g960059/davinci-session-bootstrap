@@ -995,7 +995,7 @@ def _sync_take_clips(project: Any, resolve: Any, folder: Any, take: TakeConfig) 
     sync_settings = {
         resolve.AUDIO_SYNC_MODE: resolve.AUDIO_SYNC_WAVEFORM,
         resolve.AUDIO_SYNC_CHANNEL_NUMBER: resolve.AUDIO_SYNC_CHANNEL_MIX,
-        resolve.AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO: False,
+        resolve.AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO: True,
         resolve.AUDIO_SYNC_RETAIN_VIDEO_METADATA: True,
     }
     result = project.GetMediaPool().AutoSyncAudio([*video_clips, audio_clip], sync_settings)
@@ -2102,6 +2102,9 @@ def bootstrap_session(
                 "working_skipped": skipped_working,
                 "synced_video_count": synced_video_count,
                 "sync_audio": sync_audio_path,
+                "sync_retain_embedded_audio": True,
+                "expected_audio_streams_after_sync": len(take.camera_files) + 1,
+                "audio_layout": "video embedded scratch audio retained, plus audio-master",
                 "source_dir": str(take.source_dir),
                 "editing_audio": str(take.editing_audio_path()),
             }
@@ -2408,6 +2411,8 @@ def inspect_resolve_session(
                 "clips": actual_clips,
                 "missing_clips": missing_clips,
                 "extra_clips": extra_clips,
+                "expected_audio_streams_after_sync": len(take.camera_files) + 1,
+                "audio_layout": "video embedded scratch audio retained, plus audio-master",
             }
             payload["take_bins"].append(take_payload)
             if folder is None:

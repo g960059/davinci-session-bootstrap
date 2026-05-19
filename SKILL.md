@@ -15,6 +15,8 @@ Default behavior stops at a Resolve-ready handoff:
 2. **prepare-resolve-session**: Resolve project, imports, audio proxies,
    waveform sync, `00_color_prep_all_takes`, storage paths, and HLG -> SDR
    Rec.709 color management.
+   Waveform sync must retain each video clip's embedded scratch audio; do not
+   replace video audio with `audio-master`.
 3. **inspect-resolve-session**: verify the Resolve project, take bins, clips,
    color settings, and project snapshot.
 4. **operator-handoff**: write `reports/operator-handoff.md` for the human

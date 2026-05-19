@@ -82,6 +82,10 @@ class FakeResolveClip:
     def GetName(self) -> str:
         return self._name
 
+    def SetName(self, name: str) -> bool:
+        self._name = name
+        return True
+
     def GetClipProperty(self) -> dict[str, str]:
         return {"File Path": self._path, "Frames": str(self._frames)}
 
@@ -414,6 +418,57 @@ class ReviewPipelineTests(unittest.TestCase):
             self.assertEqual([entry.take_id for entry in report.inferred_order], ["take-02", "take-03", "take-01"])
             self.assertTrue(markdown_path.is_file())
             self.assertIn("take-02 -> take-03 -> take-01", markdown_path.read_text(encoding="utf-8"))
+
+    def test_resolve_waveform_sync_retains_embedded_scratch_audio(self) -> None:
+        class FakeResolveApi:
+            AUDIO_SYNC_MODE = "mode"
+            AUDIO_SYNC_WAVEFORM = "waveform"
+            AUDIO_SYNC_CHANNEL_NUMBER = "channel"
+            AUDIO_SYNC_CHANNEL_MIX = "mix"
+            AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO = "retain_embedded_audio"
+            AUDIO_SYNC_RETAIN_VIDEO_METADATA = "retain_video_metadata"
+
+        class FakeSyncMediaPool:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[FakeResolveClip], dict[str, object]]] = []
+
+            def AutoSyncAudio(self, clips: list[FakeResolveClip], settings: dict[str, object]) -> bool:
+                self.calls.append((clips, settings))
+                return True
+
+        class FakeSyncProject:
+            def __init__(self, media_pool: FakeSyncMediaPool) -> None:
+                self._media_pool = media_pool
+
+            def GetMediaPool(self) -> FakeSyncMediaPool:
+                return self._media_pool
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_session(root, reference_angle=None, takes={"take-01": ["angle-a", "angle-b", "angle-c"]})
+            session = load_session(root / "session.yaml")
+            _take_ref, take = iter_session_takes(session)[0]
+            clips = [
+                FakeResolveClip(camera.label, take.resolve_path(camera.file))
+                for camera in take.camera_files
+            ]
+            clips.append(FakeResolveClip("audio-master", take.editing_audio_path()))
+            folder = FakeResolveFolder("take-01", clips=clips)
+            media_pool = FakeSyncMediaPool()
+
+            synced_count, sync_audio = resolve_ops._sync_take_clips(
+                FakeSyncProject(media_pool),
+                FakeResolveApi(),
+                folder,
+                take,
+            )
+
+            self.assertEqual(synced_count, 3)
+            self.assertEqual(sync_audio, str(take.editing_audio_path()))
+            self.assertEqual(len(media_pool.calls), 1)
+            _clips, settings = media_pool.calls[0]
+            self.assertIs(settings[FakeResolveApi.AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO], True)
+            self.assertIs(settings[FakeResolveApi.AUDIO_SYNC_RETAIN_VIDEO_METADATA], True)
 
     def test_cli_help_shows_standard_pipeline_and_hides_cdl_commands(self) -> None:
         stdout = io.StringIO()

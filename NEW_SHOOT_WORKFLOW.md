@@ -98,7 +98,8 @@ Resolve では `00_color_prep_all_takes` を開きます。
 - `compact-v1`, `compact-v2`, ... は詰め込み行。
 - 実際の画角名は clip item の `angle-a`, `angle-b`, ... を見る。
 - A1 は master audio のみ。
-- camera scratch audio は timeline に載せない。
+- source video clips の embedded scratch audio は保持される。
+- camera scratch audio は color prep timeline には載せない。
 - Color Page では Local Grade を使う。
 - 同じ angle の別 take へは Gallery Still / Apply Grade を使い、最後は take ごとに微調整する。
 

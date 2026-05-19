@@ -17,6 +17,8 @@ In scope:
 
 - Auto-grouping `incoming/` media into takes.
 - Resolve project bootstrap and waveform sync.
+- Resolve waveform sync keeps each video clip's embedded scratch audio; each
+  take bin keeps the angle clips plus a separate `audio-master` clip.
 - Audio edit proxy generation when needed.
 - Resolve cache, gallery stills, and project backup storage preflight.
 - Sony α6400 PP10 HLG -> YouTube SDR Rec.709 project color management.

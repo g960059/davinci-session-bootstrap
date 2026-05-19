@@ -250,7 +250,8 @@ The video tracks are named `compact-v1`, `compact-v2`, and so on.  The clip
 items keep the semantic angle labels, so the Color page still shows which
 angle you are grading while avoiding sparse empty tracks. The video items are
 video-only and the audio track is the external `audio.aif` / `audio-edit.wav`
-path. Camera scratch audio is not placed in this timeline.
+path. Camera scratch audio is retained on the source video clips but is not
+placed in this timeline.
 
 Go to the Color page and work on the source angle timeline items.
 
