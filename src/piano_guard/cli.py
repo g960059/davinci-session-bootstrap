@@ -126,10 +126,13 @@ def _format_color_prep_take_rows(color_prep: dict[str, Any]) -> list[list[Any]]:
                 continue
             label = angle.get("angle", "")
             track = angle.get("track_index", "")
+            scratch_track = angle.get("scratch_track_index", "")
             start = angle.get("record_frame", angle.get("start_frame", ""))
             confidence = angle.get("sync_confidence")
+            linked = angle.get("video_scratch_linked")
             suffix = f", conf {confidence}" if confidence is not None else ""
-            angle_parts.append(f"{label}@V{track} start {start}{suffix}")
+            link_suffix = "" if linked is None else f", linked {linked}"
+            angle_parts.append(f"{label}@V{track}/A{scratch_track} start {start}{suffix}{link_suffix}")
         rows.append(
             [
                 take.get("take_id", ""),
@@ -162,8 +165,8 @@ def _write_prepare_markdown(session: Any, payload: dict[str, Any]) -> Path:
         "- Confirm timeline start timecode is `00:00:00;00`.",
         "- Use `compact-v1`, `compact-v2`, ... as packed rows.",
         "- Grade by each clip item's `angle-*` label, not by track name.",
-        "- Source video clips retain embedded scratch audio after Resolve waveform sync.",
-        "- Camera scratch audio is not placed in color prep; A1 is `master-audio` only.",
+        "- Source video clips are not Resolve-AutoSynced to the master; scratch audio remains embedded camera audio.",
+        "- A1 is `master-audio`; A2+ are linked camera scratch tracks for sync QA.",
         "",
         "## Stages",
         "",
@@ -179,6 +182,8 @@ def _write_prepare_markdown(session: Any, payload: dict[str, Any]) -> Path:
                 ["start_timecode", color_prep.get("start_timecode", "")],
                 ["angles", ", ".join(color_prep.get("angles") or [])],
                 ["video_tracks", color_prep.get("max_video_tracks", "")],
+                ["audio_tracks", color_prep.get("audio_track_count", "")],
+                ["scratch_tracks", ", ".join((color_prep.get("scratch_audio_track_map") or {}).keys())],
                 ["take_count", color_prep.get("take_count", "")],
             ],
         ),
@@ -741,7 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     prepare_parser = subparsers.add_parser(
         "prepare-resolve-session",
-        help="prepare Resolve project, sync media, and build the color prep timeline",
+        help="prepare Resolve project, estimate sync offsets, and build the color prep timeline",
     )
     prepare_parser.add_argument("session_root")
     prepare_parser.add_argument("--project-name")

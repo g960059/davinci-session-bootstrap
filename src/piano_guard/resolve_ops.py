@@ -1022,22 +1022,12 @@ def _take_angle_clips(folder: Any, take: TakeConfig) -> list[Any]:
     return _clips_for_paths(folder, video_paths)
 
 
-def _sync_take_clips(project: Any, resolve: Any, folder: Any, take: TakeConfig) -> tuple[int, str]:
+def _prepare_take_sync_sources(folder: Any, take: TakeConfig) -> tuple[int, str]:
     video_paths, audio_path = _take_media_paths(take)
     video_clips = _clips_for_paths(folder, video_paths)
-    audio_clip = _clips_for_paths(folder, [audio_path])[0]
+    _clips_for_paths(folder, [audio_path])[0]
     if not video_clips:
         raise ResolveError(f"no video clips available for sync in {folder.GetName()}")
-
-    sync_settings = {
-        resolve.AUDIO_SYNC_MODE: resolve.AUDIO_SYNC_WAVEFORM,
-        resolve.AUDIO_SYNC_CHANNEL_NUMBER: resolve.AUDIO_SYNC_CHANNEL_MIX,
-        resolve.AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO: True,
-        resolve.AUDIO_SYNC_RETAIN_VIDEO_METADATA: True,
-    }
-    result = project.GetMediaPool().AutoSyncAudio([*video_clips, audio_clip], sync_settings)
-    if not result:
-        raise ResolveError(f"Resolve waveform sync failed for take {take.take_id}")
     _ensure_take_clip_names(folder, take)
     return len(video_clips), str(audio_path)
 
@@ -1683,7 +1673,7 @@ def _append_color_prep_clip(
     track_index: int,
     record_frame: int,
     frame_count: int,
-) -> None:
+) -> Any:
     appended = media_pool.AppendToTimeline(
         [
             {
@@ -1698,6 +1688,39 @@ def _append_color_prep_clip(
     )
     if not appended:
         raise ResolveError(f"unable to append {clip.GetName()} to color prep timeline")
+    return appended[0]
+
+
+def _set_color_prep_items_linked(timeline: Any, items: list[Any]) -> bool:
+    if not hasattr(timeline, "SetClipsLinked"):
+        return False
+    return bool(timeline.SetClipsLinked(items, True))
+
+
+def _timeline_item_identity(item: Any) -> tuple[str, int | None, tuple[str, int] | None]:
+    track_identity: tuple[str, int] | None = None
+    if hasattr(item, "GetTrackTypeAndIndex"):
+        try:
+            track_type, track_index = item.GetTrackTypeAndIndex()
+            track_identity = (str(track_type), int(track_index))
+        except Exception:
+            track_identity = None
+    return (_timeline_item_clip_name(item), _timeline_item_start(item), track_identity)
+
+
+def _timeline_items_are_linked(left: Any, right: Any) -> bool | None:
+    if left is None or right is None:
+        return False
+    if not hasattr(left, "GetLinkedItems"):
+        return None
+    try:
+        linked_items = list(left.GetLinkedItems() or [])
+    except Exception:
+        return None
+    if right in linked_items:
+        return True
+    right_identity = _timeline_item_identity(right)
+    return any(_timeline_item_identity(item) == right_identity for item in linked_items)
 
 
 def _build_color_prep_timeline(
@@ -1745,11 +1768,14 @@ def _build_color_prep_timeline(
     if max_video_tracks <= 0:
         raise ResolveError("cannot build color prep timeline without camera files")
 
+    expected_audio_tracks = max_video_tracks + 1
     _ensure_track_count(timeline, "video", max_video_tracks)
-    _ensure_track_count(timeline, "audio", 1)
+    _ensure_track_count(timeline, "audio", expected_audio_tracks)
     for index in range(1, max_video_tracks + 1):
         _set_track_name_if_possible(timeline, "video", index, f"compact-v{index}")
     _set_track_name_if_possible(timeline, "audio", 1, "master-audio")
+    for index in range(1, max_video_tracks + 1):
+        _set_track_name_if_possible(timeline, "audio", index + 1, f"scratch-compact-v{index}")
 
     frame_rate = _timeline_frame_rate_value(session.timeline)
     gap_frames = int(round(frame_rate * float(session.resolve.color_prep_gap_seconds)))
@@ -1758,6 +1784,7 @@ def _build_color_prep_timeline(
     issues: list[Issue] = []
     angle_order = {angle: index for index, angle in enumerate(angles)}
     video_track_map = {f"compact-v{index}": index for index in range(1, max_video_tracks + 1)}
+    scratch_audio_track_map = {f"scratch-compact-v{index}": index + 1 for index in range(1, max_video_tracks + 1)}
 
     for take_ref, take in iter_session_takes(session):
         folder = _folder_by_name(takes_root, take_ref.id)
@@ -1785,7 +1812,7 @@ def _build_color_prep_timeline(
             sync = sync_by_angle[angle]
             sync_confidence = float(sync["confidence"])
             clip_record_frame = audio_record_frame + int(sync["offset_frames"])
-            _append_color_prep_clip(
+            video_item = _append_color_prep_clip(
                 media_pool,
                 clip=clip,
                 media_type=VIDEO_ONLY_MEDIA_TYPE,
@@ -1793,6 +1820,24 @@ def _build_color_prep_timeline(
                 record_frame=clip_record_frame,
                 frame_count=frame_count,
             )
+            scratch_item = _append_color_prep_clip(
+                media_pool,
+                clip=clip,
+                media_type=AUDIO_ONLY_MEDIA_TYPE,
+                track_index=track_index + 1,
+                record_frame=clip_record_frame,
+                frame_count=frame_count,
+            )
+            linked = _set_color_prep_items_linked(timeline, [video_item, scratch_item])
+            if not linked:
+                issues.append(
+                    Issue(
+                        severity="warn",
+                        code="color_prep_scratch_link_failed",
+                        message=f"{take_ref.id}/{angle}: unable to link video item and scratch audio item",
+                        context={"take_id": take_ref.id, "angle": angle, "video_track_index": track_index, "scratch_track_index": track_index + 1},
+                    )
+                )
             take_frame_counts.append((clip_record_frame - record_frame) + frame_count)
             if sync_confidence < COLOR_PREP_SYNC_CONFIDENCE_WARN:
                 issues.append(
@@ -1817,8 +1862,11 @@ def _build_color_prep_timeline(
                     "angle": angle,
                     "clip_name": clip.GetName(),
                     "track_index": track_index,
+                    "scratch_track_index": track_index + 1,
                     "frame_count": frame_count,
                     "record_frame": clip_record_frame,
+                    "scratch_record_frame": clip_record_frame,
+                    "video_scratch_linked": linked,
                     "sync_offset_frames": int(sync["offset_frames"]),
                     "sync_offset_seconds": round(float(sync["offset_seconds"]), 4),
                     "sync_confidence": round(sync_confidence, 4),
@@ -1872,6 +1920,8 @@ def _build_color_prep_timeline(
         "video_track_map": video_track_map,
         "max_video_tracks": max_video_tracks,
         "audio_track": "master-audio",
+        "scratch_audio_track_map": scratch_audio_track_map,
+        "audio_track_count": expected_audio_tracks,
         "gap_seconds": float(session.resolve.color_prep_gap_seconds),
         "gap_frames": gap_frames,
         "take_count": len(take_payloads),
@@ -1892,6 +1942,7 @@ def _inspect_color_prep_timeline(project: Any, session: SessionProjectConfig) ->
         "layout": COLOR_PREP_LAYOUT,
         "expected_angles": angles,
         "expected_video_track_count": max((len(take.camera_files) for _take_ref, take in iter_session_takes(session)), default=0),
+        "expected_audio_track_count": 0,
         "video_track_count": 0,
         "audio_track_count": 0,
         "video_track_names": [],
@@ -1946,6 +1997,8 @@ def _inspect_color_prep_timeline(project: Any, session: SessionProjectConfig) ->
         for index in range(1, audio_count + 1)
     ]
     expected_video_track_count = int(payload["expected_video_track_count"])
+    expected_audio_track_count = expected_video_track_count + 1
+    payload["expected_audio_track_count"] = expected_audio_track_count
     if video_count < expected_video_track_count:
         issues.append(
             Issue(
@@ -1955,12 +2008,13 @@ def _inspect_color_prep_timeline(project: Any, session: SessionProjectConfig) ->
                 context={"expected": expected_video_track_count, "observed": video_count},
             )
         )
-    if audio_count < 1:
+    if audio_count < expected_audio_track_count:
         issues.append(
             Issue(
                 severity="fail",
                 code="color_prep_audio_track_missing",
-                message="color prep timeline has no audio track",
+                message=f"color prep timeline has {audio_count} audio tracks, expected at least {expected_audio_track_count}",
+                context={"expected": expected_audio_track_count, "observed": audio_count},
             )
         )
 
@@ -1990,6 +2044,24 @@ def _inspect_color_prep_timeline(project: Any, session: SessionProjectConfig) ->
                 },
             )
         )
+    for index in range(1, expected_video_track_count + 1):
+        audio_index = index + 1
+        expected_name = f"scratch-compact-v{index}"
+        observed = payload["audio_track_names"][audio_index - 1] if audio_index <= len(payload["audio_track_names"]) else ""
+        if observed and observed != expected_name:
+            issues.append(
+                Issue(
+                    severity="warn",
+                    code="color_prep_track_name_mismatch",
+                    message=f"audio track {audio_index} is named {observed!r}, expected {expected_name!r}",
+                    context={
+                        "track_type": "audio",
+                        "track_index": audio_index,
+                        "expected": expected_name,
+                        "observed": observed,
+                    },
+                )
+            )
 
     markers = timeline.GetMarkers() or {}
     payload["markers"] = markers
@@ -2012,6 +2084,12 @@ def _inspect_color_prep_timeline(project: Any, session: SessionProjectConfig) ->
         ],
         key=lambda item: _timeline_item_start(item) if _timeline_item_start(item) is not None else -1,
     )
+    scratch_items_by_track: dict[int, list[Any]] = {}
+    for track_index in range(2, expected_audio_track_count + 1):
+        scratch_items_by_track[track_index] = sorted(
+            _color_prep_timeline_items(timeline, "audio", track_index),
+            key=lambda item: _timeline_item_start(item) if _timeline_item_start(item) is not None else -1,
+        )
 
     angle_order = {angle: index for index, angle in enumerate(angles)}
     for take_ref, take in iter_session_takes(session):
@@ -2047,6 +2125,16 @@ def _inspect_color_prep_timeline(project: Any, session: SessionProjectConfig) ->
             item_start = _timeline_item_start(item) if item is not None else None
             observed_name = _timeline_item_clip_name(item) if item is not None else None
             exists = item is not None and observed_name == angle
+            scratch_track_index = track_index + 1
+            scratch_item = (
+                scratch_items_by_track.get(scratch_track_index, []).pop(0)
+                if scratch_items_by_track.get(scratch_track_index)
+                else None
+            )
+            scratch_start = _timeline_item_start(scratch_item) if scratch_item is not None else None
+            scratch_name = _timeline_item_clip_name(scratch_item) if scratch_item is not None else None
+            scratch_exists = scratch_item is not None and scratch_name == angle
+            linked = _timeline_items_are_linked(item, scratch_item) if exists and scratch_exists else False
             take_payload["angles"].append(
                 {
                     "angle": angle,
@@ -2055,6 +2143,11 @@ def _inspect_color_prep_timeline(project: Any, session: SessionProjectConfig) ->
                     "track_index": track_index,
                     "start_frame": item_start,
                     "observed_name": observed_name,
+                    "scratch_audio_exists": scratch_exists,
+                    "scratch_track_index": scratch_track_index,
+                    "scratch_start_frame": scratch_start,
+                    "scratch_observed_name": scratch_name,
+                    "video_scratch_linked": linked,
                 }
             )
             if not exists:
@@ -2069,6 +2162,46 @@ def _inspect_color_prep_timeline(project: Any, session: SessionProjectConfig) ->
                             "track_index": track_index,
                             "observed_name": observed_name,
                         },
+                    )
+                )
+            if not scratch_exists:
+                issues.append(
+                    Issue(
+                        severity="fail",
+                        code="color_prep_scratch_audio_item_missing",
+                        message=f"{take_ref.id}/{angle}: color prep scratch audio item is missing",
+                        context={
+                            "take_id": take_ref.id,
+                            "angle": angle,
+                            "track_index": scratch_track_index,
+                            "observed_name": scratch_name,
+                        },
+                    )
+                )
+            if exists and scratch_exists and item_start != scratch_start:
+                issues.append(
+                    Issue(
+                        severity="fail",
+                        code="color_prep_scratch_audio_start_mismatch",
+                        message=(
+                            f"{take_ref.id}/{angle}: video starts at {item_start}, "
+                            f"scratch audio starts at {scratch_start}"
+                        ),
+                        context={
+                            "take_id": take_ref.id,
+                            "angle": angle,
+                            "video_start": item_start,
+                            "scratch_start": scratch_start,
+                        },
+                    )
+                )
+            if exists and scratch_exists and linked is False:
+                issues.append(
+                    Issue(
+                        severity="fail",
+                        code="color_prep_video_scratch_unlinked",
+                        message=f"{take_ref.id}/{angle}: video item and scratch audio item are not linked",
+                        context={"take_id": take_ref.id, "angle": angle},
                     )
                 )
 
@@ -2131,17 +2264,17 @@ def bootstrap_session(
     for take_ref, take in iter_session_takes(session):
         working_folder = _working_take_folder(media_pool, folders["takes"], take)
         imported_working, skipped_working = _ensure_take_source_clips(media_pool, folders["takes"], working_folder, take)
-        synced_video_count, sync_audio_path = _sync_take_clips(project, connection.resolve, working_folder, take)
+        sync_video_count, sync_audio_path = _prepare_take_sync_sources(working_folder, take)
         take_payloads.append(
             {
                 "take_id": take_ref.id,
                 "working_imported": imported_working,
                 "working_skipped": skipped_working,
-                "synced_video_count": synced_video_count,
+                "sync_method": "piano_guard_waveform_offsets",
+                "sync_video_count": sync_video_count,
                 "sync_audio": sync_audio_path,
-                "sync_retain_embedded_audio": True,
-                "expected_audio_streams_after_sync": len(take.camera_files) + 1,
-                "audio_layout": "video embedded scratch audio retained, plus audio-master",
+                "resolve_auto_sync_audio": False,
+                "audio_layout": "video embedded scratch audio only; audio-master remains separate on A1",
                 "source_dir": str(take.source_dir),
                 "editing_audio": str(take.editing_audio_path()),
             }
@@ -2448,8 +2581,8 @@ def inspect_resolve_session(
                 "clips": actual_clips,
                 "missing_clips": missing_clips,
                 "extra_clips": extra_clips,
-                "expected_audio_streams_after_sync": len(take.camera_files) + 1,
-                "audio_layout": "video embedded scratch audio retained, plus audio-master",
+                "resolve_auto_sync_audio": False,
+                "audio_layout": "video embedded scratch audio only; audio-master remains separate on A1",
             }
             payload["take_bins"].append(take_payload)
             if folder is None:

@@ -107,9 +107,9 @@ YouTube SDR の単一カメラ撮影はこの扱いです。
 
 - `compact-v1`, `compact-v2`, ... は詰め込み行。
 - 実際の画角名は clip item の `angle-a`, `angle-b`, ... を見る。
-- A1 は master audio のみ。
+- A1 は master audio。
+- A2 以降は camera scratch audio。同期確認用で、対応する video item と link される。
 - source video clips の embedded scratch audio は保持される。
-- camera scratch audio は color prep timeline には載せない。
 - Color Page では Local Grade を使う。
 - 同じ angle の別 take へは Gallery Still / Apply Grade を使い、最後は take ごとに微調整する。
 
@@ -152,7 +152,7 @@ Convert Timeline to Multicam Clip
 
 - color grade が残っているか。
 - A1 が `audio-master` になっているか。
-- camera scratch audio が混ざっていないか。
+- A2 以降の scratch audio が最終音声に混ざっていないか。
 - sync がズレていないか。
 - angle switching できるか。
 

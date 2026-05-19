@@ -94,12 +94,19 @@ class FakeTimelineItem:
     def __init__(self, name: str, start: int) -> None:
         self._name = name
         self._start = start
+        self._linked_items: list["FakeTimelineItem"] = []
 
     def GetName(self) -> str:
         return self._name
 
     def GetStart(self, _subframe_precision: bool = False) -> int:
         return self._start
+
+    def GetLinkedItems(self) -> list["FakeTimelineItem"]:
+        return list(self._linked_items)
+
+    def link_items(self, items: list["FakeTimelineItem"]) -> None:
+        self._linked_items = [item for item in items if item is not self]
 
 
 class FakeResolveFolder:
@@ -178,6 +185,15 @@ class FakeResolveTimeline:
 
     def GetItemListInTrack(self, track_type: str, index: int) -> list[FakeTimelineItem]:
         return list(self._items.get((track_type, index), []))
+
+    def SetClipsLinked(self, items: list[FakeTimelineItem], linked: bool) -> bool:
+        if linked:
+            for item in items:
+                item.link_items(items)
+        else:
+            for item in items:
+                item.link_items([])
+        return True
 
 
 class FakeResolveProject:
@@ -419,30 +435,7 @@ class ReviewPipelineTests(unittest.TestCase):
             self.assertTrue(markdown_path.is_file())
             self.assertIn("take-02 -> take-03 -> take-01", markdown_path.read_text(encoding="utf-8"))
 
-    def test_resolve_waveform_sync_retains_embedded_scratch_audio(self) -> None:
-        class FakeResolveApi:
-            AUDIO_SYNC_MODE = "mode"
-            AUDIO_SYNC_WAVEFORM = "waveform"
-            AUDIO_SYNC_CHANNEL_NUMBER = "channel"
-            AUDIO_SYNC_CHANNEL_MIX = "mix"
-            AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO = "retain_embedded_audio"
-            AUDIO_SYNC_RETAIN_VIDEO_METADATA = "retain_video_metadata"
-
-        class FakeSyncMediaPool:
-            def __init__(self) -> None:
-                self.calls: list[tuple[list[FakeResolveClip], dict[str, object]]] = []
-
-            def AutoSyncAudio(self, clips: list[FakeResolveClip], settings: dict[str, object]) -> bool:
-                self.calls.append((clips, settings))
-                return True
-
-        class FakeSyncProject:
-            def __init__(self, media_pool: FakeSyncMediaPool) -> None:
-                self._media_pool = media_pool
-
-            def GetMediaPool(self) -> FakeSyncMediaPool:
-                return self._media_pool
-
+    def test_take_sync_sources_do_not_auto_sync_master_into_video_clips(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _write_session(root, reference_angle=None, takes={"take-01": ["angle-a", "angle-b", "angle-c"]})
@@ -454,21 +447,15 @@ class ReviewPipelineTests(unittest.TestCase):
             ]
             clips.append(FakeResolveClip("audio-master", take.editing_audio_path()))
             folder = FakeResolveFolder("take-01", clips=clips)
-            media_pool = FakeSyncMediaPool()
 
-            synced_count, sync_audio = resolve_ops._sync_take_clips(
-                FakeSyncProject(media_pool),
-                FakeResolveApi(),
+            sync_count, sync_audio = resolve_ops._prepare_take_sync_sources(
                 folder,
                 take,
             )
 
-            self.assertEqual(synced_count, 3)
+            self.assertEqual(sync_count, 3)
             self.assertEqual(sync_audio, str(take.editing_audio_path()))
-            self.assertEqual(len(media_pool.calls), 1)
-            _clips, settings = media_pool.calls[0]
-            self.assertIs(settings[FakeResolveApi.AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO], True)
-            self.assertIs(settings[FakeResolveApi.AUDIO_SYNC_RETAIN_VIDEO_METADATA], True)
+            self.assertEqual([clip.GetName() for clip in folder.GetClipList()], ["angle-a", "angle-b", "angle-c", "audio-master"])
 
     def test_single_video_take_is_valid_for_auto_grouping(self) -> None:
         self.assertTrue(autogroup._is_production_take([object()], 0.70))
@@ -594,24 +581,31 @@ class ReviewPipelineTests(unittest.TestCase):
             self.assertEqual(payload["layout"], "compact")
             self.assertEqual(payload["angles"], ["angle-b", "angle-c", "angle-d"])
             self.assertEqual(payload["video_track_map"], {"compact-v1": 1, "compact-v2": 2})
+            self.assertEqual(payload["scratch_audio_track_map"], {"scratch-compact-v1": 2, "scratch-compact-v2": 3})
             self.assertEqual(payload["max_video_tracks"], 2)
+            self.assertEqual(payload["audio_track_count"], 3)
             self.assertEqual(payload["gap_frames"], 150)
             self.assertEqual([take["record_frame"] for take in payload["takes"]], [0, 280])
             self.assertEqual([take["marker_frame"] for take in payload["takes"]], [0, 285])
             self.assertEqual(payload["takes"][0]["audio"]["record_frame"], 0)
             self.assertEqual(payload["takes"][1]["audio"]["record_frame"], 285)
             self.assertEqual(payload["takes"][1]["timeline_zero_shift_frames"], 5)
+            self.assertTrue(all(angle["video_scratch_linked"] for take in payload["takes"] for angle in take["angles"]))
 
             calls = media_pool.append_calls
-            self.assertEqual(len(calls), 6)
+            self.assertEqual(len(calls), 10)
             self.assertEqual(
                 [(call["mediaType"], call["trackIndex"], call["recordFrame"]) for call in calls],
                 [
                     (resolve_ops.VIDEO_ONLY_MEDIA_TYPE, 1, 0),
+                    (resolve_ops.AUDIO_ONLY_MEDIA_TYPE, 2, 0),
                     (resolve_ops.VIDEO_ONLY_MEDIA_TYPE, 2, 10),
+                    (resolve_ops.AUDIO_ONLY_MEDIA_TYPE, 3, 10),
                     (resolve_ops.AUDIO_ONLY_MEDIA_TYPE, 1, 0),
                     (resolve_ops.VIDEO_ONLY_MEDIA_TYPE, 1, 285),
+                    (resolve_ops.AUDIO_ONLY_MEDIA_TYPE, 2, 285),
                     (resolve_ops.VIDEO_ONLY_MEDIA_TYPE, 2, 280),
+                    (resolve_ops.AUDIO_ONLY_MEDIA_TYPE, 3, 280),
                     (resolve_ops.AUDIO_ONLY_MEDIA_TYPE, 1, 285),
                 ],
             )
@@ -621,6 +615,8 @@ class ReviewPipelineTests(unittest.TestCase):
             self.assertEqual(timeline.GetTrackName("video", 1), "compact-v1")
             self.assertEqual(timeline.GetTrackName("video", 2), "compact-v2")
             self.assertEqual(timeline.GetTrackName("audio", 1), "master-audio")
+            self.assertEqual(timeline.GetTrackName("audio", 2), "scratch-compact-v1")
+            self.assertEqual(timeline.GetTrackName("audio", 3), "scratch-compact-v2")
             self.assertIn("piano_guard:color_prep:take-01", {marker["customData"] for marker in timeline.GetMarkers().values()})
             self.assertEqual(
                 {marker["customData"]: frame for frame, marker in timeline.GetMarkers().items()},
@@ -632,6 +628,7 @@ class ReviewPipelineTests(unittest.TestCase):
             self.assertEqual(inspected["start_frame"], 0)
             self.assertEqual(inspected["layout"], "compact")
             self.assertEqual(inspected["expected_video_track_count"], 2)
+            self.assertEqual(inspected["expected_audio_track_count"], 3)
             self.assertEqual([take["marker_frame"] for take in inspected["takes"]], [0, 285])
             self.assertEqual(inspected["takes"][1]["audio_start"], 285)
             self.assertEqual(
@@ -642,6 +639,14 @@ class ReviewPipelineTests(unittest.TestCase):
                 ],
                 [280],
             )
+            take_02_angle_d = [
+                angle
+                for angle in inspected["takes"][1]["angles"]
+                if angle["angle"] == "angle-d"
+            ][0]
+            self.assertEqual(take_02_angle_d["scratch_track_index"], 3)
+            self.assertEqual(take_02_angle_d["scratch_start_frame"], 280)
+            self.assertTrue(take_02_angle_d["video_scratch_linked"])
             self.assertEqual(issues, [])
 
     def test_inspect_color_prep_timeline_fails_on_default_start_timecode(self) -> None:

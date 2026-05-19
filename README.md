@@ -18,9 +18,9 @@ In scope:
 - Auto-grouping `incoming/` media into takes.
 - Single-camera sessions are supported; one video plus one master audio is a
   valid production take.
-- Resolve project bootstrap and waveform sync.
-- Resolve waveform sync keeps each video clip's embedded scratch audio; each
-  take bin keeps the angle clips plus a separate `audio-master` clip.
+- Resolve project bootstrap and waveform offset placement.
+- The bootstrap does not Resolve-AutoSync `audio-master` into video clips; each
+  take bin keeps embedded-scratch angle clips plus a separate `audio-master`.
 - Audio edit proxy generation when needed.
 - Resolve cache, gallery stills, and project backup storage preflight.
 - Sony α6400 PP10 HLG -> YouTube SDR Rec.709 project color management.
@@ -189,15 +189,17 @@ After bootstrap:
 3. Use the compact video tracks (`compact-v1`, `compact-v2`, ...) as packed
    rows; the clip item names keep the semantic labels such as `angle-a` through
    `angle-f`.
-4. On the Color page, use Local Grades on the source angle timeline items.
-5. Match angles within the same take first.
-6. Save useful angle grades as Gallery Stills and apply them as starting points
+4. Use `A1=master-audio` as final/reference audio. `A2+` scratch tracks are
+   linked to their video items and are for sync QA only.
+5. On the Color page, use Local Grades on the source angle timeline items.
+6. Match angles within the same take first.
+7. Save useful angle grades as Gallery Stills and apply them as starting points
    for the same angle in the next take, then adjust independently.
-7. Do not use Remote Grades, Shared Nodes, or CDL commands for the standard
+8. Do not use Remote Grades, Shared Nodes, or CDL commands for the standard
    workflow.
-8. Duplicate the color-prep timeline before manual multicam conversion or
+9. Duplicate the color-prep timeline before manual multicam conversion or
    downstream editing.
-9. Use final timeline grades only for light take-to-take finishing after edit
+10. Use final timeline grades only for light take-to-take finishing after edit
    lock.
 
 ## Experimental CDL Tools

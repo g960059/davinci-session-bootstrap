@@ -13,10 +13,10 @@ Default behavior stops at a Resolve-ready handoff:
 
 1. **group-session**: `<session-root>/incoming/` media -> `takes/take-XX/`.
 2. **prepare-resolve-session**: Resolve project, imports, audio proxies,
-   waveform sync, `00_color_prep_all_takes`, storage paths, and HLG -> SDR
+   waveform offset placement, `00_color_prep_all_takes`, storage paths, and HLG -> SDR
    Rec.709 color management.
-   Waveform sync must retain each video clip's embedded scratch audio; do not
-   replace video audio with `audio-master`.
+   Do not Resolve-AutoSync `audio-master` into video clips. Camera scratch
+   audio must remain the clip's embedded audio, with `audio-master` separate.
 3. **inspect-resolve-session**: verify the Resolve project, take bins, clips,
    color settings, and project snapshot.
 4. **operator-handoff**: write `reports/operator-handoff.md` for the human
@@ -131,16 +131,19 @@ After Stage B, the operator works in Resolve:
 2. Confirm the expected project color management is still active.
 3. Treat `compact-v1`, `compact-v2`, ... as packed rows; grade by the clip item
    label (`angle-a`, `angle-b`, ...) rather than by track name.
-4. On the Color page, use **Local Grades** on the source angle timeline items.
-5. Match angles within the same take first: white keys, black piano finish,
+4. Treat `A1=master-audio` as the final/reference audio. `A2+` scratch tracks
+   are sync-QA tracks linked to their video items; use them only to inspect or
+   repair sync.
+5. On the Color page, use **Local Grades** on the source angle timeline items.
+6. Match angles within the same take first: white keys, black piano finish,
    gold plate, skin when visible, and window highlights.
-6. Grab Gallery Stills for each angle and apply them as starting points for
+7. Grab Gallery Stills for each angle and apply them as starting points for
    the next take, then adjust exposure/WB for that take.
-7. Do not use Remote Grades, Shared Nodes, or CDL commands for the standard
+8. Do not use Remote Grades, Shared Nodes, or CDL commands for the standard
    workflow.
-8. Duplicate the color-prep timeline before manual multicam conversion or
+9. Duplicate the color-prep timeline before manual multicam conversion or
    downstream editing.
-9. Use final timeline grades only for light take-to-take finishing.
+10. Use final timeline grades only for light take-to-take finishing.
 
 ## Hand-Off Message
 
